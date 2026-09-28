@@ -1,0 +1,12 @@
+source,scope,reference,source_total,reference_total,diff,pct_diff,n_suppressed_cells,explained_by_suppression,status
+OVERALL: sum of yearly rows,1999-2024,OVERALL Total row,32646,32646,0,0,NA,NA,reconciles
+RACE: sum of group totals,1999-2024,OVERALL Total row,33905,32646,1259,3.856521472768486,NA,NA,excess (categories overlap / double-count)
+AGE: sum of group totals,1999-2024,OVERALL Total row,32646,32646,0,0,NA,NA,reconciles
+CENSUS_REGION: sum of group totals,1999-2024,OVERALL Total row,32646,32646,0,0,NA,NA,reconciles
+URBANIZATION: sum of group totals,1999-2020,OVERALL 1999-2020,25565,25565,0,0,NA,NA,reconciles
+STATES,1999-2024,OVERALL Total row,32638,32646,-8,-0.024505299270967347,1,TRUE,shortfall (small-cell suppression?)
+STATES,1999-2020,OVERALL 1999-2020,25565,25565,0,0,0,TRUE,reconciles
+STATES,2021-2024,OVERALL 2021-2024,7073,7081,-8,-0.11297839288236125,1,TRUE,shortfall (small-cell suppression?)
+POD,1999-2024,OVERALL Total row,32644,32646,-2,-0.006126324817741837,1,TRUE,shortfall (small-cell suppression?)
+POD,1999-2020,OVERALL 1999-2020,25565,25565,0,0,0,TRUE,reconciles
+POD,2021-2024,OVERALL 2021-2024,7079,7081,-2,-0.028244598220590313,1,TRUE,shortfall (small-cell suppression?)

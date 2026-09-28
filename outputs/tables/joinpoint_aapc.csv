@@ -1,0 +1,16 @@
+cohort,range,start_year,end_year,aapc,ci_lower,ci_upper,p_value,t_stat,significant,p_less_than_flag,file,group,n_joinpoints
+All - 1 Joinpoint,Full Range,1999,2024,1.4113,1.0423,1.7815,1e-6,7.5367,TRUE,TRUE,OVERALL,Overall,1
+White - 2 Joinpoints,Full Range,1999,2024,1.545,0.9093,2.1847,2e-6,4.7852,TRUE,FALSE,RACE,White,2
+Black or African American - 0 Joinpoints,Full Range,1999,2024,0.6434,-0.2137,1.5079,0.134808,1.5476,FALSE,FALSE,RACE,Black or African American,0
+Hispanic or Latino - 0 Joinpoints,Full Range,1999,2024,0.2294,-0.4445,0.9079,0.489978,0.7011,FALSE,FALSE,RACE,Hispanic or Latino,0
+Asian - 0 Joinpoints,Full Range,2018,2024,-0.4985,-10.1161,10.1482,0.904366,-0.1264,FALSE,FALSE,RACE,Asian,0
+American Indian or Alaska Native - 0 Joinpoints,Full Range,2021,2024,-0.9326,-12.6349,12.337,0.778827,-0.3207,FALSE,FALSE,RACE,American Indian or Alaska Native,0
+35-54 yrs - 0 Joinpoints,Full Range,1999,2024,1.4854,0.8224,2.1528,1.03e-4,4.6426,TRUE,FALSE,AGE,35-54 yrs,0
+55-74 yrs - 1 Joinpoint,Full Range,1999,2024,2.2276,1.6357,2.823,1e-6,7.4363,TRUE,TRUE,AGE,55-74 yrs,1
+75+ yrs - 3 Joinpoints,Full Range,1999,2024,0.5942,-0.0895,1.2825,0.088647,1.7026,FALSE,FALSE,AGE,75+ yrs,3
+Census Region 1: Northeast - 1 Joinpoint,Full Range,1999,2024,2.7888,-0.1987,5.8658,0.067581,1.8278,FALSE,FALSE,CENSUS_REGION,Census Region 1: Northeast,1
+Census Region 2: Midwest - 1 Joinpoint,Full Range,1999,2024,1.1589,0.251,2.075,0.012243,2.5051,TRUE,FALSE,CENSUS_REGION,Census Region 2: Midwest,1
+Census Region 3: South - 0 Joinpoints,Full Range,1999,2024,1.7846,1.4481,2.1223,1e-6,11.0228,TRUE,TRUE,CENSUS_REGION,Census Region 3: South,0
+Census Region 4: West - 0 Joinpoints,Full Range,1999,2024,1.031,0.3978,1.6681,0.002555,3.3672,TRUE,FALSE,CENSUS_REGION,Census Region 4: West,0
+Metro - 1 Joinpoint,Full Range,1999,2020,1.0798,0.6478,1.5137,1e-6,4.9148,TRUE,FALSE,URBANIZATION,Metro,1
+Non Metro - 0 Joinpoints,Full Range,1999,2020,2.251,1.6195,2.8865,1e-6,7.4949,TRUE,TRUE,URBANIZATION,Non Metro,0

@@ -1,0 +1,1280 @@
+---
+title: "Trends in Vulvar Cancer Mortality in the United States, 1999-2024"
+subtitle: "CDC WONDER (ICD-10 C51) - Google Data Analytics workflow"
+format:
+  html:
+    toc: true
+    code-fold: true
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+Render with `quarto render vulvar_cancer_analysis.qmd` from the folder containing the seven .xlsx files
+(edit `data_dir` in the first chunk). Chunks are cumulative; do not reorder them.
+
+# Setup
+
+## 0.1 Setup: packages, paths, output folders, seed
+
+```{r}
+#| label: s0-1
+# All library() calls live in this one block.
+# NOTE: `segmented`, `usmap`, `lmtest`, `sandwich`, `knitr` are called with pkg:: (not attached) on purpose.
+# Attaching `segmented` also attaches MASS, whose select() masks dplyr::select() and silently breaks tidyverse code.
+suppressPackageStartupMessages({
+  library(tidyverse)   # dplyr, tidyr, purrr, readr, stringr, forcats, ggplot2, tibble
+  library(readxl)      # read .xlsx
+  library(janitor)     # clean_names()
+  library(gt)          # publication tables
+  library(patchwork)   # multi-panel figures
+  library(scales)      # comma(), viridis_pal()
+  library(forecast)    # auto.arima(), ets(), checkresiduals()
+})
+needed       <- c("segmented", "usmap", "lmtest", "sandwich", "knitr")
+missing_pkgs <- needed[!vapply(needed, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  stop("Install first: install.packages(c(", paste0('"', missing_pkgs, '"', collapse = ", "), "))")
+}
+
+data_dir <- "."                                   # <- EDIT: folder that holds the 7 .xlsx files
+out_dir  <- "outputs"
+fig_dir  <- file.path(out_dir, "figures")
+tab_dir  <- file.path(out_dir, "tables")
+walk(c(out_dir, fig_dir, tab_dir), dir.create, showWarnings = FALSE, recursive = TRUE)
+
+seed <- 20260924L
+set.seed(seed)                                    # only segmented bootstrap / simulated chi-square use RNG
+study_years <- 1999:2024
+theme_set(theme_minimal(base_size = 11) +
+            theme(plot.title = element_text(face = "bold"),
+                  plot.caption = element_text(size = 7, hjust = 0, colour = "grey30"),
+                  legend.position = "bottom"))
+```
+
+## 0.2 Small helpers used by every phase (numeric coercion, flag detection, exporters)
+
+```{r}
+#| label: s0-2
+alpha_z <- qnorm(0.975)
+
+# Text -> numeric. "Suppressed"/"Unreliable"/"" become NA (never 0). Handles "0.6270*", "< 0.000001", "2.69E-4", "1,234".
+to_num  <- function(x) suppressWarnings(as.numeric(str_remove_all(x, "[,\\s*<]")))
+# TRUE where the raw text is a CDC suppression / unreliable flag
+is_flag <- function(x) coalesce(str_detect(x, regex("suppress|unreliab", ignore_case = TRUE)), FALSE)
+
+save_tbl <- function(df, name) {                  # every table -> CSV
+  path <- file.path(tab_dir, paste0(name, ".csv"))
+  readr::write_csv(df, path); message("saved: ", path); invisible(df)
+}
+save_md <- function(df, name, caption = NULL) {   # every table -> knitr::kable markdown (paste into Methods)
+  txt <- knitr::kable(df, format = "markdown", caption = caption, digits = 3)
+  writeLines(txt, file.path(tab_dir, paste0(name, ".md"))); print(txt); invisible(txt)
+}
+save_fig <- function(p, name, width, height) {    # every figure -> PNG, 300 dpi, stated size (inches)
+  path <- file.path(fig_dir, paste0(name, ".png"))
+  ggsave(path, p, width = width, height = height, units = "in", dpi = 300, bg = "white")
+  message("saved: ", path, " (", width, " x ", height, " in, 300 dpi)"); print(p); invisible(p)
+}
+cap_std <- paste0("Source: CDC WONDER, NVSS Underlying Cause of Death, ICD-10 C51. Rates per 100,000, age-adjusted to the 2000 U.S. standard population.\n",
+                  "CDC suppresses counts <10; age-adjusted rates based on <20 deaths are flagged unreliable.")
+```
+
+# Phase 1 - ASK
+
+## 1.1 ASK: research questions, stakeholders (tibbles -> kable -> CSV)
+
+```{r}
+#| label: s1-1
+research_questions <- tribble(
+  ~question_id, ~question_text, ~variables_used, ~source_file, ~planned_method,
+  "RQ1", "What is the overall 1999-2024 trend in vulvar cancer age-adjusted mortality, and is there a detectable breakpoint (data-driven; also pre/post-2011 candidate)?",
+         "year; deaths; age-adjusted rate (AAMR); 95% CI", "OVERALL.xlsx",
+         "Extract CDC Joinpoint AAPC/APC; own log-linear APC (OLS/WLS); segmented regression + Davies test; AIC/BIC",
+  "RQ2", "Did mortality change in the COVID era (2020-2024) relative to the pre-2020 trajectory?",
+         "year; AAMR; SE", "OVERALL.xlsx",
+         "Pre/post Welch t + Wilcoxon (effect size, CI); interrupted time series (Newey-West SE); observed vs counterfactual",
+  "RQ3", "How do rates, trends and rate ratios differ by race/ethnicity and by age band?",
+         "group; year; AAMR; SE; deaths", "RACE.xlsx; AGE.xlsx",
+         "Group-specific log-linear APC vs Joinpoint AAPC; rate ratios vs White (delta-method CI)",
+  "RQ4", "How does mortality vary geographically: Census region, metro vs non-metro, and state?",
+         "group; year; AAMR; SE; state deaths", "CENSUS_REGION.xlsx; URBANIZATION.xlsx; STATES.xlsx",
+         "Region and urbanization rate ratios (delta-method CI); state choropleth of cumulative counts",
+  "RQ5", "Where do women die of vulvar cancer, and did place of death shift between 1999-2020 and 2021-2024?",
+         "place_of_death; deaths by period", "POD.xlsx",
+         "Period-specific shares; two-proportion tests with Holm adjustment; simulated chi-square",
+  "RQ6", "What is the plausible near-term trajectory (to 2040) if current patterns continue?",
+         "year; AAMR", "OVERALL.xlsx",
+         "Linear extrapolation (prediction intervals); auto.arima / ets forecasts with intervals and CV accuracy"
+)
+stakeholders <- tribble(
+  ~stakeholder, ~primary_interest, ~how_findings_are_used, ~linked_questions,
+  "SEER / NCI", "Benchmarking mortality against incidence and survival surveillance", "Compare CDC AAPC with SEER trends; identify surveillance gaps", "RQ1; RQ3; RQ4",
+  "ACOG and gynecologic oncology societies", "Clinical guidance, early recognition, referral pathways", "Age-specific burden; recognition of vulvar dermatoses and biopsy of persistent lesions", "RQ1; RQ3; RQ6",
+  "State health departments", "Resource allocation, cancer control planning", "State and regional burden; urban-rural disparity", "RQ4",
+  "HPV-related patient advocacy groups", "Prevention, vaccination uptake, awareness", "Trend in younger bands as the HPV-associated subset (interpretation limited)", "RQ1; RQ3",
+  "Public health policymakers", "Funding, equity, palliative-care capacity", "Disparity rate ratios; place-of-death shifts; projection scenarios", "RQ2; RQ4; RQ5; RQ6"
+)
+save_md(research_questions, "rq_table", "Table M1. Research questions")
+save_md(stakeholders,       "stakeholder_table", "Table M2. Stakeholders")
+save_tbl(research_questions, "rq_table"); save_tbl(stakeholders, "stakeholder_table")
+```
+
+# Phase 2 - PREPARE
+
+## 2.1 PREPARE: load all 7 workbooks (all cells as TEXT so suppression strings survive; header promoted deliberately)
+
+```{r}
+#| label: s2-1
+files <- c(OVERALL = "OVERALL.xlsx", RACE = "RACE.xlsx", AGE = "AGE.xlsx", CENSUS_REGION = "CENSUS_REGION.xlsx",
+           URBANIZATION = "URBANIZATION.xlsx", STATES = "STATES.xlsx", POD = "POD.xlsx")
+paths <- setNames(file.path(data_dir, files), names(files))
+stopifnot("Missing input file(s) - check data_dir" = all(file.exists(paths)))
+
+# Columns that belong to the WONDER table itself (A:G). Anything to the right is embedded Joinpoint output.
+n_main_cols <- c(OVERALL = 7, RACE = 7, AGE = 7, CENSUS_REGION = 7, URBANIZATION = 7, STATES = 6, POD = 5)
+
+read_sheet_text <- function(path) {
+  # col_types = "text": numbers, "Suppressed", "0.6270*", "< 0.000001" all arrive as strings; nothing is silently coerced
+  readxl::read_excel(path, sheet = 1, col_names = FALSE, col_types = "text", .name_repair = "minimal")
+}
+promote_header <- function(df, n_cols) {
+  df  <- df[, seq_len(n_cols)]
+  nm  <- str_squish(as.character(unlist(df[1, ])))
+  bad <- is.na(nm) | nm == ""
+  nm[bad] <- paste0("unnamed_", which(bad))          # blank header (STATES col F) gets a stable name
+  df  <- df[-1, ]
+  names(df) <- nm
+  df
+}
+sheet_names <- map(paths, readxl::excel_sheets)
+raw_full    <- map(paths, read_sheet_text)            # whole sheet incl. Joinpoint blocks (used in Phase 4)
+raw         <- imap(raw_full, \(x, id) promote_header(x, n_main_cols[[id]]))  # WONDER table only
+```
+
+## 2.2 PREPARE: inspect every file (dim, glimpse, sheets, raw names, key values, suppression strings)
+
+```{r}
+#| label: s2-2
+inspect_file <- function(x, id) {
+  cat("\n=====", id, "=====\n")
+  cat("Sheets:", paste(sheet_names[[id]], collapse = ", "), "\n")
+  cat("dim() rows x cols (header promoted; still incl. Total / blank / footnote rows):", dim(x), "\n")
+  cat("Raw column names:", paste0("[", names(x), "]", collapse = " "), "\n")
+  glimpse(x)
+  cat("Unique values in first column:\n"); print(sort(unique(x[[1]][!is.na(x[[1]])])))
+  if ("Year" %in% names(x)) {
+    cat("Unique Year strings:", paste(sort(unique(na.omit(x[["Year"]]))), collapse = " "), "\n")
+  }
+  vals <- unlist(x[-1])                               # exclude label column so RACE footnote prose is not counted
+  cat("Cells containing 'Suppressed':", sum(str_detect(vals, regex("suppress", ignore_case = TRUE)), na.rm = TRUE),
+      "| 'Unreliable':", sum(str_detect(vals, regex("unreliab", ignore_case = TRUE)), na.rm = TRUE), "\n")
+  invisible(NULL)
+}
+iwalk(raw, inspect_file)
+```
+
+## 2.3 PREPARE: data inventory table (built from the loaded objects, not typed)
+
+```{r}
+#| label: s2-3
+inventory <- imap_dfr(raw, \(x, id) {
+  lab      <- x[[1]]
+  is_strat <- "Year" %in% names(x)
+  yrs      <- if (is_strat) to_num(x[["Year"]]) else rep(NA_real_, nrow(x))
+  period_years <- as.integer(unlist(str_extract_all(names(x), "\\d{4}")))
+  year_range <- if (is_strat) paste(min(yrs, na.rm = TRUE), max(yrs, na.rm = TRUE), sep = "-")
+                else paste0(min(period_years), "-", max(period_years), " (two period columns)")
+  levels_raw <- if (is_strat) lab[!is.na(yrs)] else lab
+  levels_    <- unique(na.omit(levels_raw[!str_to_lower(levels_raw) %in% "total"]))
+  tibble(
+    file = files[[id]], rows_raw = nrow(x), cols_main_table = ncol(x),
+    year_range = year_range, n_strata = length(levels_),
+    strata_levels = if (length(levels_) <= 6) paste(levels_, collapse = "; ")
+                    else paste0(length(levels_), " levels, e.g. ", paste(head(levels_, 3), collapse = "; "), "..."),
+    total_rows  = sum(str_to_lower(lab) %in% "total") + if (!is_strat) sum(is.na(lab) & rowSums(!is.na(x)) > 0) else 0,
+    footnote_rows = if (is_strat) sum(is.na(yrs) & !is.na(lab) & !str_to_lower(lab) %in% "total") else 0L,
+    n_suppressed_cells  = sum(is_flag(unlist(x[-1])) & str_detect(unlist(x[-1]), regex("suppress", ignore_case = TRUE)), na.rm = TRUE),
+    n_unreliable_cells  = sum(str_detect(unlist(x[-1]), regex("unreliab", ignore_case = TRUE)), na.rm = TRUE),
+    has_joinpoint_block = any(grepl("ESTIMATED JOINTPOINTS", as.matrix(raw_full[[id]]), fixed = TRUE))
+  )
+})
+print(inventory)
+save_md(inventory, "data_inventory", "Table S1. Data inventory (generated from loaded files)")
+save_tbl(inventory, "data_inventory")
+```
+
+# Phase 3 - PROCESS
+
+## 3.1 PROCESS: reusable cleaning functions (conversion log, SE diagnostics, stratified-file cleaner)
+
+```{r}
+#| label: s3-1
+# One row per (file, column): NA count before/after coercion, and how many cells were CDC flag strings.
+# unexpected_na must be 0, otherwise something non-numeric that is NOT a known flag was silently turned into NA.
+conversion_row <- function(x, file, column) {
+  tibble(file = file, column = column,
+         na_before    = sum(is.na(x) | str_trim(x) == ""),
+         flag_strings = sum(is_flag(x)),
+         na_after     = sum(is.na(to_num(x)))) |>
+    mutate(unexpected_na = na_after - na_before - flag_strings)
+}
+
+# Sanity-check the reported Standard Error against two independent yardsticks:
+#  (1) CI-implied SE  = (upper - lower) / (2 * 1.96)
+#  (2) Poisson SE     = rate / sqrt(deaths)          (approximation)
+# Primary flag = reported SE is >3x or <1/3 of the CI-implied SE. Classical and robust z-scores are kept for reference
+# (a naive ">3 SD from stratum mean" rule can MISS a block of bad values because they inflate the SD themselves).
+add_se_diagnostics <- function(df, ratio_tol = 3) {
+  df |>
+    mutate(se_ci  = (ci_upper - ci_lower) / (2 * alpha_z),
+           se_log = if_else(ci_lower > 0 & ci_upper > 0,
+                            (log(ci_upper) - log(ci_lower)) / (2 * alpha_z),   # log-scale SE from CI (respects asymmetry)
+                            se_reported / rate),
+           se_pois       = rate / sqrt(deaths),
+           se_ratio_ci   = se_reported / se_ci,
+           se_ratio_pois = se_reported / se_pois) |>
+    group_by(file, group) |>
+    mutate(se_z    = (se_reported - mean(se_reported, na.rm = TRUE)) / sd(se_reported, na.rm = TRUE),
+           se_mad  = mad(se_reported, na.rm = TRUE),
+           se_robust_z = if_else(se_mad > 0, (se_reported - median(se_reported, na.rm = TRUE)) / se_mad, NA_real_)) |>
+    ungroup() |>
+    mutate(se_suspect = coalesce(se_ratio_ci > ratio_tol | se_ratio_ci < 1 / ratio_tol, FALSE),
+           se_source  = if_else(se_suspect, "CI-implied (reported SE failed check)", "reported"),
+           se         = if_else(se_suspect, se_ci, se_reported)) |>
+    select(-se_mad)
+}
+
+clean_stratified <- function(raw_df, file_id, strat_label) {
+  stopifnot(ncol(raw_df) == 7)
+
+  # (1) '0verall' (digit zero) -> 'Overall' BEFORE janitor sees it (clean_names would turn it into 'x0verall')
+  nm <- names(raw_df)
+  n_header_fixed <- sum(nm == "0verall")
+  nm[nm == "0verall"] <- "Overall"
+  names(raw_df) <- nm
+
+  # (2) standardise names; first column (Race / Age / Census Regions / Urbanization / Overall) becomes `group`
+  df <- raw_df |>
+    janitor::clean_names() |>
+    rename(group = 1, year_raw = year, deaths_raw = deaths, rate_raw = age_adjusted_rate,
+           ci_lower_raw = matches("lower"), ci_upper_raw = matches("upper"), se_raw = matches("standard_error"))
+  stopifnot(identical(names(df), c("group", "year_raw", "deaths_raw", "rate_raw", "ci_lower_raw", "ci_upper_raw", "se_raw")))
+
+  # (3) classify every row: data / total / footnote / blank
+  df <- df |>
+    mutate(group = str_squish(group),
+           blank = if_all(everything(), is.na),
+           year_num = to_num(year_raw),
+           row_type = case_when(blank ~ "blank",
+                                !is.na(year_num) ~ "data",
+                                str_to_lower(group) == "total" ~ "total",
+                                !is.na(group) ~ "footnote",
+                                TRUE ~ "other"),
+           stratum = if_else(row_type == "data", group, NA_character_)) |>
+    tidyr::fill(stratum, .direction = "down")        # a 'Total' row inherits the stratum printed above it
+
+  footnotes <- df |> filter(row_type == "footnote") |> pull(group)             # kept for the Limitations section
+  totals    <- df |> filter(row_type == "total") |>
+    transmute(group = stratum, total_deaths = to_num(deaths_raw))              # kept for the reconciliation check
+  dat <- df |> filter(row_type == "data")
+
+  # (4) numeric coercion with an audit trail; flags are created BEFORE coercion so the information is not lost
+  num_cols <- c("year_raw", "deaths_raw", "rate_raw", "ci_lower_raw", "ci_upper_raw", "se_raw")
+  log <- map_dfr(num_cols, \(cl) conversion_row(dat[[cl]], file_id, cl))
+  dat <- dat |>
+    mutate(deaths_suppressed = is_flag(deaths_raw),
+           rate_suppressed   = is_flag(rate_raw),
+           rate_flag_text    = coalesce(str_detect(rate_raw, regex("unreliab", ignore_case = TRUE)), FALSE),
+           across(all_of(num_cols), to_num)) |>
+    rename(year = year_raw, deaths = deaths_raw, rate = rate_raw,
+           ci_lower = ci_lower_raw, ci_upper = ci_upper_raw, se_reported = se_raw)
+
+  # (5) Year: double -> integer (fail loudly if any value is not a whole number)
+  stopifnot("Non-integer Year found" = all(dat$year == floor(dat$year), na.rm = TRUE))
+  dat <- dat |>
+    mutate(year = as.integer(year),
+           # CDC rule: rates based on <20 deaths are unreliable; also true if the text says so or the count is suppressed
+           rate_unreliable = rate_flag_text | deaths_suppressed | coalesce(deaths < 20, FALSE),
+           file = file_id, stratifier = strat_label) |>
+    add_se_diagnostics() |>
+    select(file, stratifier, group, year, deaths, rate, ci_lower, ci_upper, se, se_reported, se_source, se_suspect,
+           se_log, se_ci, se_pois, se_ratio_ci, se_ratio_pois, se_z, se_robust_z,
+           deaths_suppressed, rate_suppressed, rate_unreliable)
+
+  # (6) Total row must equal the sum of its stratum's year rows (kept, not forced)
+  chk <- dat |> group_by(group) |> summarise(sum_rows = sum(deaths, na.rm = TRUE), .groups = "drop") |>
+    left_join(totals, by = "group") |> mutate(match = sum_rows == total_deaths, file = file_id)
+
+  list(data = dat, totals = chk, footnotes = footnotes, log = log, header_fixed = n_header_fixed)
+}
+```
+
+## 3.2 PROCESS: clean OVERALL, RACE, AGE, CENSUS_REGION, URBANIZATION
+
+```{r}
+#| label: s3-2
+strat_specs <- tribble(~file_id, ~strat_label,
+                       "OVERALL", "Overall", "RACE", "Race/ethnicity", "AGE", "Age group",
+                       "CENSUS_REGION", "Census region", "URBANIZATION", "Urbanization")
+processed <- pmap(strat_specs, \(file_id, strat_label) clean_stratified(raw[[file_id]], file_id, strat_label)) |>
+  setNames(strat_specs$file_id)
+
+overall_clean <- processed$OVERALL$data
+race_clean    <- processed$RACE$data
+age_clean     <- processed$AGE$data
+region_clean  <- processed$CENSUS_REGION$data
+urban_clean   <- processed$URBANIZATION$data
+
+race_footnotes <- processed$RACE$footnotes                 # text for the Limitations section
+stratum_totals <- map_dfr(processed, "totals")              # 'Total' row deaths, kept for reconciliation
+conversion_log <- map_dfr(processed, "log")
+header_fixed   <- map_int(processed, "header_fixed")
+
+cat("\n'0verall' header repaired (count by file; expect 1 for OVERALL, 0 elsewhere):\n"); print(header_fixed)
+cat("\nRACE footnote rows captured in `race_footnotes`:\n"); print(race_footnotes)
+cat("\nTotal-row check (sum of year rows == Total row):\n"); print(stratum_totals)
+overall_total_row <- stratum_totals |> filter(file == "OVERALL") |> pull(total_deaths)
+```
+
+## 3.3 PROCESS: STATES and POD (Suppressed -> NA, state-name standardisation, unified totals)
+
+```{r}
+#| label: s3-3
+clean_states <- function(raw_df) {
+  stopifnot(ncol(raw_df) == 6)
+  df <- raw_df |> janitor::clean_names()
+  stopifnot(str_detect(names(df)[4], "1999_2020"), str_detect(names(df)[5], "2021_2024"))
+  names(df) <- c("state_raw", "fips", "abbr", "d1_raw", "d2_raw", "total_file_raw")
+  # The 6th column (blank header) is NOT empty in this file: it is the row total. Keep it for validation, then drop it.
+  is_total <- str_to_lower(str_squish(df$state_raw)) %in% "total"
+  total_row <- df[is_total, ]
+  body <- df[!is_total & !is.na(df$state_raw), ]
+
+  log <- map_dfr(c("d1_raw", "d2_raw", "total_file_raw"), \(cl) conversion_row(body[[cl]], "STATES", cl))
+  state_lookup <- tibble(abbr = c(state.abb, "DC"), state = c(state.name, "District of Columbia"))
+
+  body <- body |>
+    mutate(supp_1999_2020 = is_flag(d1_raw), supp_2021_2024 = is_flag(d2_raw),
+           across(c(d1_raw, d2_raw, total_file_raw, fips), to_num),
+           fips = sprintf("%02d", as.integer(fips))) |>
+    rename(deaths_1999_2020 = d1_raw, deaths_2021_2024 = d2_raw, total_deaths_file = total_file_raw) |>
+    left_join(state_lookup, by = "abbr")
+
+  stopifnot("Unmatched state abbreviation" = !anyNA(body$state))
+  stopifnot("State names differ by more than capitalisation" =
+              all(str_to_lower(str_squish(body$state_raw)) == str_to_lower(body$state)))
+  case_fixes <- body |> filter(str_squish(state_raw) != state) |> select(state_raw, state)
+
+  # Unified total: 'Suppressed' stays NA in its period column; the sum treats it as unknown-but-nonzero, so it is a LOWER BOUND
+  body <- body |>
+    mutate(total_deaths = coalesce(deaths_1999_2020, 0) + coalesce(deaths_2021_2024, 0),
+           total_is_lower_bound = supp_1999_2020 | supp_2021_2024)
+  stopifnot("Computed state totals differ from the file's own total column" = all(body$total_deaths == body$total_deaths_file))
+
+  list(data = body |> select(state, abbr, fips, deaths_1999_2020, deaths_2021_2024, supp_1999_2020, supp_2021_2024,
+                             total_deaths, total_is_lower_bound),
+       total_row = tibble(deaths_1999_2020 = to_num(total_row$d1_raw), deaths_2021_2024 = to_num(total_row$d2_raw),
+                          total = to_num(total_row$total_file_raw)),
+       n_suppressed = sum(body$supp_1999_2020) + sum(body$supp_2021_2024), case_fixes = case_fixes, log = log)
+}
+
+clean_pod <- function(raw_df) {
+  stopifnot(ncol(raw_df) == 5)
+  df <- raw_df |> janitor::clean_names()
+  names(df) <- c("place_of_death", "code", "d1_raw", "d2_raw", "total_file_raw")
+  df <- df[rowSums(!is.na(df)) > 0, ]
+  is_total <- is.na(df$place_of_death) | str_to_lower(str_squish(df$place_of_death)) == "total"   # POD's Total row has no label
+  total_row <- df[is_total, ]; body <- df[!is_total, ]
+  log <- map_dfr(c("d1_raw", "d2_raw", "total_file_raw"), \(cl) conversion_row(body[[cl]], "POD", cl))
+  body <- body |>
+    mutate(supp_1999_2020 = is_flag(d1_raw), supp_2021_2024 = is_flag(d2_raw),
+           across(c(code, d1_raw, d2_raw, total_file_raw), to_num)) |>
+    rename(deaths_1999_2020 = d1_raw, deaths_2021_2024 = d2_raw, total_deaths_file = total_file_raw) |>
+    mutate(place_of_death = str_squish(place_of_death),
+           total_deaths_calc = coalesce(deaths_1999_2020, 0) + coalesce(deaths_2021_2024, 0),
+           total_is_lower_bound = supp_1999_2020 | supp_2021_2024,
+           structural_zero_period = coalesce(deaths_1999_2020 == 0, FALSE) | coalesce(deaths_2021_2024 == 0, FALSE))  # true 0s kept as 0
+  stopifnot("POD computed totals differ from file total column" = all(body$total_deaths_calc == body$total_deaths_file))
+  list(data = body |> select(-total_deaths_file),
+       total_row = tibble(deaths_1999_2020 = to_num(total_row$d1_raw), deaths_2021_2024 = to_num(total_row$d2_raw),
+                          total = to_num(total_row$total_file_raw)),
+       n_suppressed = sum(body$supp_1999_2020) + sum(body$supp_2021_2024), log = log)
+}
+
+states_out <- clean_states(raw$STATES); states_clean <- states_out$data; states_total_row <- states_out$total_row
+pod_out    <- clean_pod(raw$POD);       pod_clean    <- pod_out$data;    pod_total_row    <- pod_out$total_row
+conversion_log <- bind_rows(conversion_log, states_out$log, pod_out$log)
+
+cat("\nState names changed (capitalisation only):\n"); print(states_out$case_fixes)
+cat("\nStates with a suppressed period:\n"); print(filter(states_clean, total_is_lower_bound))
+cat("\nPOD categories with a true zero period:\n"); print(filter(pod_clean, structural_zero_period) |> select(place_of_death, starts_with("deaths_")))
+cat("\nConversion audit (unexpected_na must be 0 everywhere):\n"); print(conversion_log, n = Inf)
+```
+
+## 3.4 PROCESS: cross-file reconciliation (logged, never forced) + scope checks
+
+```{r}
+#| label: s3-4
+recon_row <- function(source, scope, source_total, reference_total, reference, n_supp = NA_integer_) {
+  tibble(source = source, scope = scope, reference = reference, source_total = source_total, reference_total = reference_total,
+         diff = source_total - reference_total, pct_diff = 100 * (source_total - reference_total) / reference_total,
+         n_suppressed_cells = n_supp,
+         explained_by_suppression = if_else(is.na(n_supp), NA, abs(source_total - reference_total) <= 9 * n_supp),  # suppressed cells hold 1-9 deaths
+         status = case_when(source_total == reference_total ~ "reconciles",
+                            source_total <  reference_total ~ "shortfall (small-cell suppression?)",
+                            TRUE ~ "excess (categories overlap / double-count)"))
+}
+ov_by_period <- overall_clean |>
+  mutate(period = if_else(year <= 2020, "1999-2020", "2021-2024")) |>
+  group_by(period) |> summarise(deaths = sum(deaths, na.rm = TRUE), .groups = "drop") |> deframe()
+strat_sum <- stratum_totals |> group_by(file) |> summarise(total = sum(total_deaths, na.rm = TRUE), .groups = "drop") |> deframe()
+
+recon <- bind_rows(
+  recon_row("OVERALL: sum of yearly rows", "1999-2024", sum(overall_clean$deaths, na.rm = TRUE), overall_total_row, "OVERALL Total row"),
+  recon_row("RACE: sum of group totals",          "1999-2024", strat_sum[["RACE"]],          overall_total_row, "OVERALL Total row"),
+  recon_row("AGE: sum of group totals",           "1999-2024", strat_sum[["AGE"]],           overall_total_row, "OVERALL Total row"),
+  recon_row("CENSUS_REGION: sum of group totals", "1999-2024", strat_sum[["CENSUS_REGION"]], overall_total_row, "OVERALL Total row"),
+  recon_row("URBANIZATION: sum of group totals",  "1999-2020", strat_sum[["URBANIZATION"]],  ov_by_period[["1999-2020"]], "OVERALL 1999-2020"),
+  recon_row("STATES", "1999-2024", sum(states_clean$total_deaths),          overall_total_row,            "OVERALL Total row", states_out$n_suppressed),
+  recon_row("STATES", "1999-2020", sum(states_clean$deaths_1999_2020, na.rm = TRUE), ov_by_period[["1999-2020"]], "OVERALL 1999-2020", sum(states_clean$supp_1999_2020)),
+  recon_row("STATES", "2021-2024", sum(states_clean$deaths_2021_2024, na.rm = TRUE), ov_by_period[["2021-2024"]], "OVERALL 2021-2024", sum(states_clean$supp_2021_2024)),
+  recon_row("POD",    "1999-2024", sum(pod_clean$total_deaths_calc),        overall_total_row,            "OVERALL Total row", pod_out$n_suppressed),
+  recon_row("POD",    "1999-2020", sum(pod_clean$deaths_1999_2020, na.rm = TRUE), ov_by_period[["1999-2020"]], "OVERALL 1999-2020", sum(pod_clean$supp_1999_2020)),
+  recon_row("POD",    "2021-2024", sum(pod_clean$deaths_2021_2024, na.rm = TRUE), ov_by_period[["2021-2024"]], "OVERALL 2021-2024", sum(pod_clean$supp_2021_2024))
+)
+print(recon, width = Inf)
+recon |> filter(diff != 0) |>
+  pwalk(\(source, scope, diff, status, ...) message(sprintf("[reconciliation] %s (%s): differs from OVERALL by %+d -> %s", source, scope, as.integer(diff), status)))
+save_tbl(recon, "reconciliation_log")
+
+# Scope checks detected from the data, not assumed
+scope_checks <- list(
+  urban_year_range    = range(urban_clean$year),
+  urban_missing_years = setdiff(min(overall_clean$year):max(overall_clean$year), unique(urban_clean$year)),
+  age_groups          = sort(unique(age_clean$group)),
+  race_coverage       = race_clean |> group_by(group) |>
+    summarise(first_year = min(year), last_year = max(year), n_years = n(), n_unreliable = sum(rate_unreliable), .groups = "drop")
+)
+message(sprintf("[scope] URBANIZATION covers %d-%d; missing years: %s", scope_checks$urban_year_range[1], scope_checks$urban_year_range[2],
+                paste(scope_checks$urban_missing_years, collapse = ", ")))
+message("[scope] AGE bands present: ", paste(scope_checks$age_groups, collapse = " | "),
+        " -> under-35 band present? ", any(str_detect(scope_checks$age_groups, "^<|^0|^1|^2|<35")))
+print(scope_checks$race_coverage)
+```
+
+## 3.5 PROCESS: master long table (Race/Age/Region/Urbanization) + SE outlier audit
+
+```{r}
+#| label: s3-5
+wonder_long <- bind_rows(race_clean, age_clean, region_clean, urban_clean) |>
+  group_by(file, group) |>
+  mutate(identical_run_len = { r <- rle(deaths); rep(r$lengths, r$lengths) },          # runs of identical death counts
+         identical_run_flag = identical_run_len >= 3) |>
+  ungroup()
+dq_runs <- wonder_long |> filter(identical_run_flag) |> distinct(group, identical_run_len, deaths)
+if (nrow(dq_runs) > 0) {
+  message("[data quality] runs of >=3 identical yearly death counts (plausible, but verify against WONDER):")
+  print(dq_runs)
+}
+
+se_flagged <- wonder_long |> filter(se_suspect)
+se_flag_summary <- se_flagged |> group_by(file, group) |>
+  summarise(n_flagged = n(), years = paste(range(year), collapse = "-"),
+            median_ratio_vs_ci_se = median(se_ratio_ci), .groups = "drop")
+message(sprintf("[SE check] %d of %d stratum-years have a reported SE inconsistent with their own 95%% CI.", nrow(se_flagged), nrow(wonder_long)))
+print(se_flag_summary)
+cat("\nThe specific West-2024 value you asked about:\n")
+print(wonder_long |> filter(str_detect(group, "West"), year %in% 2023:2024) |>
+        select(group, year, rate, ci_lower, ci_upper, se_reported, se_ci, se_pois, se_ratio_ci, se_z, se_robust_z, se_suspect))
+cat("\nHow many flagged rows would a naive |z|>3 rule catch? ", sum(abs(wonder_long$se_z) > 3, na.rm = TRUE), "\n")
+save_tbl(se_flagged, "se_flagged_rows")
+```
+
+## 3.6 PROCESS: validation block (fails loudly if any cleaning rule did not hold)
+
+```{r}
+#| label: s3-6
+strat_list <- list(OVERALL = overall_clean, RACE = race_clean, AGE = age_clean, CENSUS_REGION = region_clean, URBANIZATION = urban_clean)
+stopifnot(
+  "A 'Total' row remains"            = !any(map_lgl(strat_list, \(d) any(str_to_lower(d$group) == "total"))),
+  "Footnote text leaked into data"   = !any(str_detect(unlist(map(strat_list, "group")), "excluded from analysis")),
+  "Year has NA"                      = !any(map_lgl(strat_list, \(d) anyNA(d$year))),
+  "Year is not integer"              = all(map_lgl(strat_list, \(d) is.integer(d$year))),
+  "Year outside 1999-2024"           = all(map_lgl(strat_list, \(d) all(d$year %in% study_years))),
+  "Numeric column not numeric"       = all(map_lgl(strat_list, \(d) all(map_lgl(d[c("deaths", "rate", "ci_lower", "ci_upper", "se")], is.numeric)))),
+  "Duplicate file/group/year"        = nrow(distinct(wonder_long, file, group, year)) == nrow(wonder_long),
+  "OVERALL should have 26 years"     = nrow(overall_clean) == length(study_years),
+  "Exactly two RACE footnotes expected" = length(race_footnotes) == 2,
+  "A stratum Total row != sum of its rows" = all(stratum_totals$match),
+  "Conversion produced unexpected NAs" = all(conversion_log$unexpected_na == 0),
+  "STATES: n rows != 51 (50 states + DC)" = nrow(states_clean) == 51,
+  "STATES: 'New york' not fixed"     = "New York" %in% states_clean$state && !"New york" %in% states_clean$state,
+  "STATES: Suppressed did not become NA" = sum(is.na(states_clean$deaths_2021_2024)) + sum(is.na(states_clean$deaths_1999_2020)) == states_out$n_suppressed,
+  "POD: Suppressed did not become NA"    = sum(is.na(pod_clean$deaths_2021_2024)) + sum(is.na(pod_clean$deaths_1999_2020)) == pod_out$n_suppressed,
+  "STATES: total row != column sums" = states_total_row$total == sum(states_clean$total_deaths),
+  "SE not positive after correction" = all(wonder_long$se > 0, na.rm = TRUE),
+  "Rate outside its own CI (beyond rounding)" = all(wonder_long$rate >= wonder_long$ci_lower - 0.006 & wonder_long$rate <= wonder_long$ci_upper + 0.006, na.rm = TRUE),
+  "Rows with <20 deaths not flagged unreliable" = all(wonder_long$rate_unreliable[wonder_long$deaths < 20 & !is.na(wonder_long$deaths)]),
+  "AGE bands differ from the expected three" = setequal(scope_checks$age_groups, c("35-54 yrs", "55-74 yrs", "75+ yrs"))
+)
+message("Validation passed: all cleaning rules held.")
+save_tbl(wonder_long, "wonder_long_master"); save_tbl(overall_clean, "overall_clean")
+save_tbl(states_clean, "states_clean"); save_tbl(pod_clean, "pod_clean"); save_tbl(conversion_log, "conversion_log")
+```
+
+# Phase 4 - ANALYZE
+
+## 4.1 ANALYZE: descriptive statistics and publication-style Table 1
+
+```{r}
+#| label: s4-1
+ov          <- overall_clean |> arrange(year) |> mutate(log_rate = log(rate))   # OVERALL series reused below
+trend_input <- bind_rows(overall_clean, wonder_long)                             # OVERALL + every stratum, one tidy frame
+
+overall_summary <- overall_clean |>
+  summarise(total_deaths = sum(deaths), first_year = min(year), last_year = max(year), n_years = n(),
+            mean_rate = mean(rate), sd_rate = sd(rate),
+            rate_first = rate[which.min(year)], rate_last = rate[which.max(year)]) |>
+  mutate(pct_change_first_last = 100 * (rate_last - rate_first) / rate_first,
+         total_matches_file_total_row = total_deaths == overall_total_row)
+print(overall_summary, width = Inf)
+
+descr_by_stratum <- trend_input |>
+  group_by(file, stratifier, group) |>
+  summarise(first_year = min(year), last_year = max(year), n_years = n(), total_deaths = sum(deaths, na.rm = TRUE),
+            mean_rate = mean(rate, na.rm = TRUE), sd_rate = sd(rate, na.rm = TRUE),
+            min_rate = min(rate, na.rm = TRUE), max_rate = max(rate, na.rm = TRUE),
+            n_unreliable_years = sum(rate_unreliable), .groups = "drop") |>
+  group_by(stratifier) |>
+  mutate(pct_of_stratifier_deaths = 100 * total_deaths / sum(total_deaths)) |>   # RACE groups overlap, so its % need not sum to the overall
+  ungroup()
+
+table1 <- descr_by_stratum |>
+  transmute(Stratifier = stratifier, Group = group, Years = paste0(first_year, "-", last_year), `n years` = n_years,
+            `Deaths (% of stratifier)` = sprintf("%s (%.1f%%)", comma(total_deaths), pct_of_stratifier_deaths),
+            `Mean AAMR (SD)` = sprintf("%.2f (%.2f)", mean_rate, sd_rate),
+            `Range` = sprintf("%.2f-%.2f", min_rate, max_rate), `Years flagged unreliable` = n_unreliable_years) |>
+  gt(groupname_col = "Stratifier") |>
+  tab_header(title = "Table 1. Vulvar cancer mortality, United States, 1999-2024",
+             subtitle = "Age-adjusted mortality rate (AAMR) per 100,000; mean of annual rates") |>
+  tab_source_note("Source: CDC WONDER (ICD-10 C51). 2000 U.S. standard population. Race groups overlap (Hispanic ethnicity); URBANIZATION ends in 2020.")
+print(table1)
+gtsave(table1, file.path(tab_dir, "table1.html"))
+save_tbl(descr_by_stratum, "table1_data"); save_tbl(overall_summary, "overall_summary")
+```
+
+## 4.2 ANALYZE: extract the embedded CDC Joinpoint output (found by marker text, so column position does not matter)
+
+```{r}
+#| label: s4-2
+parse_joinpoint <- function(raw_df, file_id) {
+  m <- as.matrix(raw_df)
+  find_marker <- function(pattern) {
+    hit <- matrix(grepl(pattern, m, ignore.case = TRUE), nrow = nrow(m))
+    which(hit, arr.ind = TRUE)
+  }
+  read_block <- function(pattern, col_names) {
+    h <- find_marker(pattern)
+    if (nrow(h) == 0) return(tibble())
+    r0 <- h[1, "row"]; c0 <- h[1, "col"]
+    cols <- c0:min(c0 + length(col_names) - 1, ncol(m))
+    rows <- list(); r <- r0 + 2                                  # r0 = marker row, r0+1 = header row, data start r0+2
+    while (r <= nrow(m) && !is.na(m[r, c0]) &&
+           !grepl("PERCENTAGE CHANGE|ESTIMATED JOINTPOINTS", m[r, c0], ignore.case = TRUE)) {
+      rows[[length(rows) + 1]] <- m[r, cols]; r <- r + 1
+    }
+    if (length(rows) == 0) return(tibble())
+    mat <- do.call(rbind, rows); colnames(mat) <- col_names[seq_along(cols)]
+    as_tibble(mat)
+  }
+  tidy_jp <- function(x, est_col = NULL) {
+    if (nrow(x) == 0) return(x)
+    if (!is.null(est_col)) x$significant <- str_detect(x[[est_col]], fixed("*"))          # Joinpoint marks p<0.05 with *
+    if ("p_value" %in% names(x)) x$p_less_than_flag <- str_detect(x$p_value, fixed("<"))   # "< 0.000001" -> 1e-6 with flag
+    x |> mutate(across(any_of(c("joinpoint_no", "joinpoint_year", "start_year", "end_year", "apc", "aapc",
+                                "ci_lower", "ci_upper", "p_value", "t_stat")), to_num),
+                file = file_id,
+                group = str_match(cohort, "^(.*?)\\s*-\\s*(\\d+)\\s+Joinpoints?$")[, 2],
+                n_joinpoints = as.integer(str_match(cohort, "^(.*?)\\s*-\\s*(\\d+)\\s+Joinpoints?$")[, 3]),
+                group = if_else(group == "All", "Overall", group))
+  }
+  list(
+    points = tidy_jp(read_block("^\\s*ESTIMATED JOINTPOINTS", c("cohort", "joinpoint_no", "joinpoint_year", "ci_lower", "ci_upper"))),
+    apc    = tidy_jp(read_block("^\\s*ANNUAL PERCENTAGE CHANGE", c("cohort", "segment", "start_year", "end_year", "apc", "ci_lower", "ci_upper", "p_value", "t_stat")), "apc"),
+    aapc   = tidy_jp(read_block("^\\s*AVERAGE ANNUAL PERCENTAGE CHANGE", c("cohort", "range", "start_year", "end_year", "aapc", "ci_lower", "ci_upper", "p_value", "t_stat")), "aapc")
+  )
+}
+jp_parsed <- imap(raw_full, \(x, id) if (id %in% strat_specs$file_id) parse_joinpoint(x, id) else NULL) |> compact()
+jp_points <- map_dfr(jp_parsed, "points")     # estimated joinpoint years with CI
+jp_apc    <- map_dfr(jp_parsed, "apc")        # segment-specific annual percent change
+jp_aapc   <- map_dfr(jp_parsed, "aapc")       # average annual percent change (full range)
+
+stopifnot("No AAPC rows parsed" = nrow(jp_aapc) >= 1, "AAPC contains NA" = !anyNA(jp_aapc$aapc),
+          "AAPC outside its own CI" = all(jp_aapc$ci_lower <= jp_aapc$aapc & jp_aapc$aapc <= jp_aapc$ci_upper),
+          "Joinpoint group not found in data" = all(jp_aapc$group %in% trend_input$group))
+jp_overall_aapc <- jp_aapc |> filter(file == "OVERALL")     # <- the tidy OVERALL AAPC tibble
+print(jp_overall_aapc, width = Inf); print(filter(jp_apc, file == "OVERALL"), width = Inf); print(filter(jp_points, file == "OVERALL"), width = Inf)
+save_tbl(jp_points, "joinpoint_estimates"); save_tbl(jp_apc, "joinpoint_apc"); save_tbl(jp_aapc, "joinpoint_aapc")
+```
+
+## 4.3 ANALYZE: own log-linear trend (APC = (exp(beta)-1)*100) vs CDC Joinpoint AAPC
+
+```{r}
+#| label: s4-3
+# Model: log(rate) = a + b*year. OLS = unweighted; WLS weights each year by 1/var(log rate) (closer to Joinpoint's weighting).
+fit_loglinear <- function(d, weighted = FALSE) {
+  d <- d |> filter(!is.na(rate), rate > 0) |> arrange(year)
+  w <- if (weighted) 1 / d$se_log^2 else rep(1, nrow(d))
+  fit <- lm(log(rate) ~ year, data = d, weights = w)
+  b <- coef(fit)[["year"]]; ci <- confint(fit)["year", ]
+  tibble(method = if (weighted) "WLS log-linear" else "OLS log-linear",
+         n_years = nrow(d), year_start = min(d$year), year_end = max(d$year),
+         apc = (exp(b) - 1) * 100, apc_lo = (exp(ci[[1]]) - 1) * 100, apc_hi = (exp(ci[[2]]) - 1) * 100,
+         p_value = summary(fit)$coefficients["year", 4],
+         dw_p = tryCatch(lmtest::dwtest(fit)$p.value, error = \(e) NA_real_))   # residual autocorrelation (small p = CIs too narrow)
+}
+min_years_trend <- 10                                     # AI/AN (4 reliable yrs) and Asian (<=7) cannot support a trend
+loglinear_trends <- trend_input |>
+  filter(!rate_unreliable) |>
+  group_by(file, stratifier, group) |>
+  filter(n() >= min_years_trend) |>
+  group_modify(\(d, k) bind_rows(fit_loglinear(d, FALSE), fit_loglinear(d, TRUE))) |>
+  ungroup()
+
+ols <- loglinear_trends |> filter(str_starts(method, "OLS")) |>
+  select(file, stratifier, group, n_years, ols_apc = apc, ols_lo = apc_lo, ols_hi = apc_hi, ols_p = p_value, dw_p)
+wls <- loglinear_trends |> filter(str_starts(method, "WLS")) |> select(file, group, wls_apc = apc, wls_lo = apc_lo, wls_hi = apc_hi)
+jp_key <- jp_aapc |> transmute(file, group, jp_aapc = aapc, jp_lo = ci_lower, jp_hi = ci_upper, jp_p = p_value,
+                               jp_n_joinpoints = n_joinpoints, jp_start = start_year, jp_end = end_year)
+
+aapc_compare <- ols |>
+  left_join(wls, by = c("file", "group")) |>
+  inner_join(jp_key, by = c("file", "group")) |>
+  mutate(diff_pp = ols_apc - jp_aapc,
+         ci_overlap = pmax(ols_lo, jp_lo) <= pmin(ols_hi, jp_hi),
+         jp_inside_ols_ci = jp_aapc >= ols_lo & jp_aapc <= ols_hi,
+         same_inference = (ols_lo > 0 | ols_hi < 0) == (jp_lo > 0 | jp_hi < 0),
+         agreement = case_when(jp_inside_ols_ci & same_inference ~ "Agree",
+                               ci_overlap ~ "Partial (CIs overlap, estimates differ)",
+                               TRUE ~ "Disagree"))
+aapc_compare_primary <- aapc_compare |> filter(file %in% c("OVERALL", "RACE"))
+print(aapc_compare_primary |> select(group, jp_n_joinpoints, jp_aapc, jp_lo, jp_hi, ols_apc, ols_lo, ols_hi, wls_apc, diff_pp, agreement), width = Inf)
+
+with(aapc_compare_primary, message(sprintf(
+  "[Joinpoint vs log-linear] OVERALL+RACE: %d of %d comparisons agree; %d partial; %d disagree.",
+  sum(agreement == "Agree"), n(), sum(str_starts(agreement, "Partial")), sum(agreement == "Disagree"))))
+aapc_compare_primary |> filter(file == "OVERALL") |>
+  with(message(sprintf("[OVERALL] CDC AAPC %.2f%% (%.2f to %.2f) vs OLS APC %.2f%% (%.2f to %.2f): %s",
+                       jp_aapc, jp_lo, jp_hi, ols_apc, ols_lo, ols_hi, agreement)))
+save_md(aapc_compare_primary |> select(group, jp_aapc, jp_lo, jp_hi, ols_apc, ols_lo, ols_hi, wls_apc, agreement), "aapc_comparison",
+        "Table 2. CDC Joinpoint AAPC vs log-linear APC")
+save_tbl(loglinear_trends, "loglinear_trends"); save_tbl(aapc_compare, "aapc_comparison_all_strata")
+```
+
+## 4.4 ANALYZE: segmented (piecewise) regression on log(rate) for OVERALL, vs the simple linear model
+
+```{r}
+#| label: s4-4
+psi_start <- jp_points |> filter(file == "OVERALL") |> pull(joinpoint_year) |> first()    # start from CDC's own estimate
+if (length(psi_start) == 0 || is.na(psi_start)) psi_start <- 2014
+lm_overall <- lm(log_rate ~ year, data = ov)
+set.seed(seed)
+segmented_fit <- segmented::segmented(lm_overall, seg.Z = ~year, psi = psi_start)
+print(summary(segmented_fit))
+
+psi_mat <- segmented_fit$psi                                   # columns: Initial, Est., St.Err
+bp_est  <- unname(psi_mat[1, 2]); bp_se <- unname(psi_mat[1, 3])
+bp_ci   <- tryCatch({ ci <- confint(segmented_fit, "year"); c(unname(ci[1, 2]), unname(ci[1, 3])) },
+                    error = \(e) bp_est + c(-1, 1) * alpha_z * bp_se)   # fallback: Wald interval
+sl      <- segmented::slope(segmented_fit)$year                # rows slope1, slope2; cols Est., St.Err., t, CI low, CI up
+to_apc  <- \(b) (exp(b) - 1) * 100
+segmented_summary <- tibble(segment = c("Before breakpoint", "After breakpoint"),
+                            start_year = c(min(ov$year), ceiling(bp_est)), end_year = c(floor(bp_est), max(ov$year)),
+                            apc = to_apc(sl[, 1]), apc_lo = to_apc(sl[, 4]), apc_hi = to_apc(sl[, 5]),
+                            breakpoint = bp_est, bp_lo = bp_ci[1], bp_hi = bp_ci[2])
+print(segmented_summary, width = Inf)
+
+dav <- segmented::davies.test(lm_overall, seg.Z = ~year, k = 10)          # H0: no breakpoint (constant slope)
+cdc_bp <- jp_points |> filter(file == "OVERALL") |> slice(1)
+model_compare <- tibble(model = c("Linear (log scale)", "Segmented, 1 breakpoint"),
+                        AIC = c(AIC(lm_overall), AIC(segmented_fit)), BIC = c(BIC(lm_overall), BIC(segmented_fit)),
+                        davies_p = c(NA, dav$p.value)) |>
+  mutate(delta_AIC = AIC - min(AIC), delta_BIC = BIC - min(BIC),
+         cdc_joinpoint = c(NA, cdc_bp$joinpoint_year), cdc_ci_lo = c(NA, cdc_bp$ci_lower), cdc_ci_hi = c(NA, cdc_bp$ci_upper),
+         breakpoint_inside_cdc_ci = c(NA, bp_est >= cdc_bp$ci_lower & bp_est <= cdc_bp$ci_upper))
+print(model_compare, width = Inf)
+
+# Sensitivity: fixed hinge at pre-specified candidate years (incl. your pre/post-2011 idea and the pre-COVID 2019)
+hinge_fit <- function(d, brk) {
+  d <- d |> mutate(h = pmax(year - brk, 0))
+  fit <- lm(log_rate ~ year + h, data = d); b <- coef(fit); V <- vcov(fit); dfr <- df.residual(fit)
+  s1 <- b[["year"]]; s2 <- b[["year"]] + b[["h"]]
+  se1 <- sqrt(V["year", "year"]); se2 <- sqrt(V["year", "year"] + V["h", "h"] + 2 * V["year", "h"])
+  tibble(break_year = brk, apc_before = to_apc(s1), apc_before_lo = to_apc(s1 - qt(.975, dfr) * se1), apc_before_hi = to_apc(s1 + qt(.975, dfr) * se1),
+         apc_after = to_apc(s2), apc_after_lo = to_apc(s2 - qt(.975, dfr) * se2), apc_after_hi = to_apc(s2 + qt(.975, dfr) * se2),
+         p_slope_change = summary(fit)$coefficients["h", 4], AIC = AIC(fit), BIC = BIC(fit))
+}
+hinge_sensitivity <- map_dfr(sort(unique(c(2011, round(bp_est), 2019))), \(b) hinge_fit(ov, b))
+print(hinge_sensitivity, width = Inf)
+save_tbl(segmented_summary, "segmented_summary"); save_tbl(model_compare, "segmented_model_compare"); save_tbl(hinge_sensitivity, "hinge_sensitivity")
+```
+
+## 4.5 ANALYZE: pre- vs post-2020 (COVID-era) comparison
+
+```{r}
+#| label: s4-5
+covid_start <- 2020L
+lab_pre  <- paste0("Pre (", min(ov$year), "-", covid_start - 1, ")")
+lab_post <- paste0("Post (", covid_start, "-", max(ov$year), ")")
+ov_cov <- ov |> mutate(period = factor(if_else(year >= covid_start, lab_post, lab_pre), levels = c(lab_pre, lab_post)))
+pre_r  <- ov_cov$rate[ov_cov$period == lab_pre]; post_r <- ov_cov$rate[ov_cov$period == lab_post]
+
+# (a) Naive pre/post tests. CAUTION: with a rising trend, post > pre almost by construction; use (b) and (c) for inference on a COVID effect.
+tt <- t.test(rate ~ period, data = ov_cov)                                   # Welch; estimate = (pre mean, post mean)
+wt <- wilcox.test(rate ~ period, data = ov_cov, conf.int = TRUE, exact = FALSE)
+n1 <- length(pre_r); n2 <- length(post_r)
+s_pool <- sqrt(((n1 - 1) * var(pre_r) + (n2 - 1) * var(post_r)) / (n1 + n2 - 2))
+d_cohen <- (mean(post_r) - mean(pre_r)) / s_pool
+g_hedges <- d_cohen * (1 - 3 / (4 * (n1 + n2) - 9))
+se_g <- sqrt((n1 + n2) / (n1 * n2) + g_hedges^2 / (2 * (n1 + n2)))
+covid_tests <- tibble(
+  test = c("Welch t-test: mean(post) - mean(pre)", "Wilcoxon: Hodges-Lehmann shift (post - pre)", "Hedges g (post vs pre)"),
+  estimate = c(unname(tt$estimate[2] - tt$estimate[1]), -unname(wt$estimate), g_hedges),
+  ci_lo = c(-tt$conf.int[2], -wt$conf.int[2], g_hedges - alpha_z * se_g),
+  ci_hi = c(-tt$conf.int[1], -wt$conf.int[1], g_hedges + alpha_z * se_g),
+  p_value = c(tt$p.value, wt$p.value, NA))
+print(covid_tests, width = Inf)
+
+# (b) Interrupted time series on log(rate): level change at 2020 and slope change, Newey-West (lag 2) SEs
+its_data <- ov |> mutate(post = as.integer(year >= covid_start), t_since = pmax(year - covid_start, 0))
+its_fit  <- lm(log_rate ~ year + post + t_since, data = its_data)
+nw       <- sandwich::NeweyWest(its_fit, lag = 2, prewhite = FALSE)
+its_ct   <- lmtest::coeftest(its_fit, vcov. = nw); its_ci <- lmtest::coefci(its_fit, vcov. = nw)
+its_table <- tibble(term = rownames(its_ct), estimate = its_ct[, 1], se_newey_west = its_ct[, 2], p_value = its_ct[, 4],
+                    ci_lo = its_ci[, 1], ci_hi = its_ci[, 2]) |>
+  filter(term != "(Intercept)") |>
+  mutate(pct_effect = to_apc(estimate), pct_lo = to_apc(ci_lo), pct_hi = to_apc(ci_hi),
+         meaning = c(year = "Pre-2020 annual % change", post = "Immediate level shift in 2020 (%)", t_since = "Change in annual % slope after 2020")[term])
+print(its_table, width = Inf)
+
+# (c) Counterfactual: extrapolate the pre-2020 log-linear trend and compare with what was observed
+fit_pre <- lm(log_rate ~ year, data = filter(ov, year < covid_start))
+cf <- predict(fit_pre, newdata = tibble(year = covid_start:max(ov$year)), interval = "prediction") |> exp() |> as_tibble()
+covid_counterfactual <- bind_cols(tibble(year = covid_start:max(ov$year)), cf) |>
+  left_join(select(ov, year, observed = rate), by = "year") |>
+  mutate(observed_to_expected = observed / fit, above_prediction_interval = observed > upr) |>
+  rename(expected = fit, expected_lo = lwr, expected_hi = upr)
+print(covid_counterfactual, width = Inf)
+save_tbl(covid_tests, "covid_prepost_tests"); save_tbl(its_table, "covid_its"); save_tbl(covid_counterfactual, "covid_counterfactual")
+```
+
+## 4.6 ANALYZE: rate ratios with 95% CI (race, region, urbanization)
+
+```{r}
+#| label: s4-6
+# Formula. For two independent groups with age-adjusted rates r1 (comparator) and r0 (reference):
+#   RR = r1 / r0;   s_i = [ln(upper_i) - ln(lower_i)] / (2*1.96)   (log-scale SE from the CDC CI, which respects its asymmetry)
+#   SE[ln RR] = sqrt(s1^2 + s0^2);   95% CI = exp( ln RR +/- 1.96 * SE[ln RR] )
+# Year-specific RRs are pooled by inverse-variance weights: ln RR_pooled = sum(w ln RR_t)/sum(w), w = 1/SE_t^2, SE = 1/sqrt(sum(w)).
+# Rates flagged unreliable (<20 deaths) are excluded. CI-implied SEs are used, so the corrupted CENSUS_REGION SE column cannot leak in.
+rr_pair_year <- function(d, ref, cmp) {
+  a <- d |> filter(group == ref) |> select(year, r_ref = rate, s_ref = se_log)
+  b <- d |> filter(group == cmp) |> select(year, r_cmp = rate, s_cmp = se_log)
+  inner_join(a, b, by = "year") |>
+    mutate(reference = ref, comparator = cmp, rr = r_cmp / r_ref, se_ln_rr = sqrt(s_ref^2 + s_cmp^2),
+           rr_lo = exp(log(rr) - alpha_z * se_ln_rr), rr_hi = exp(log(rr) + alpha_z * se_ln_rr))
+}
+pool_rr <- function(x) {
+  x |> group_by(reference, comparator) |>
+    summarise(n_years = n(), w_sum = sum(1 / se_ln_rr^2), ln_rr = sum(log(rr) / se_ln_rr^2) / w_sum,
+              se_pooled = 1 / sqrt(w_sum), q = sum((log(rr) - ln_rr)^2 / se_ln_rr^2),
+              q_p = if_else(n_years > 1, pchisq(q, n_years - 1, lower.tail = FALSE), NA_real_), .groups = "drop") |>
+    mutate(rr = exp(ln_rr), rr_lo = exp(ln_rr - alpha_z * se_pooled), rr_hi = exp(ln_rr + alpha_z * se_pooled)) |>
+    select(reference, comparator, n_years, rr, rr_lo, rr_hi, q_heterogeneity_p = q_p)
+}
+make_rr <- function(d, ref, comps) {
+  d      <- filter(d, !rate_unreliable)
+  yearly <- map_dfr(comps, \(cm) rr_pair_year(d, ref, cm))
+  yrs    <- sort(unique(yearly$year))
+  windows <- list(first_5_years = head(yrs, 5), last_5_years = tail(yrs, 5), all_years = yrs)
+  pooled <- imap_dfr(windows, \(y, nm) yearly |> filter(year %in% y) |> pool_rr() |> mutate(window = nm, window_years = paste(min(y), max(y), sep = "-")))
+  list(yearly = yearly, pooled = pooled)
+}
+race_d   <- filter(wonder_long, stratifier == "Race/ethnicity")
+region_d <- filter(wonder_long, stratifier == "Census region")
+urban_d  <- filter(wonder_long, stratifier == "Urbanization")
+rr_race   <- make_rr(race_d,   "White", setdiff(unique(race_d$group), "White"))
+rr_region <- make_rr(region_d, "Census Region 1: Northeast", setdiff(unique(region_d$group), "Census Region 1: Northeast"))
+rr_urban  <- make_rr(urban_d,  "Metro", "Non Metro")
+
+rr_race_table   <- rr_race$pooled |> mutate(overlap_caveat = str_detect(comparator, "Hispanic"))   # Hispanic ethnicity overlaps White/Black
+rr_region_table <- rr_region$pooled
+rr_urban_table  <- rr_urban$pooled
+rr_all <- bind_rows(mutate(rr_race_table, stratifier = "Race/ethnicity"), mutate(rr_region_table, stratifier = "Census region"),
+                    mutate(rr_urban_table, stratifier = "Urbanization")) |> relocate(stratifier)
+rr_excluded_unreliable <- wonder_long |> filter(rate_unreliable) |> count(stratifier, group, name = "n_unreliable_years")
+print(rr_all, n = Inf, width = Inf); print(rr_excluded_unreliable)
+save_md(rr_all |> filter(window %in% c("last_5_years", "all_years")), "rate_ratios", "Table 3. Pooled rate ratios (95% CI)")
+save_tbl(rr_all, "rate_ratios_all_windows")
+save_tbl(bind_rows(rr_race$yearly, rr_region$yearly, rr_urban$yearly), "rate_ratios_yearly")
+```
+
+## 4.7 ANALYZE: place of death, 1999-2020 vs 2021-2024 (shares, because the periods differ in length)
+
+```{r}
+#| label: s4-7
+pod_period <- pod_clean |>
+  filter(!is.na(deaths_1999_2020), !is.na(deaths_2021_2024), deaths_1999_2020 + deaths_2021_2024 > 0)   # drops categories with a suppressed period
+n_early <- sum(pod_period$deaths_1999_2020); n_late <- sum(pod_period$deaths_2021_2024)
+pod_shift <- pod_period |>
+  mutate(share_early_pct = 100 * deaths_1999_2020 / n_early, share_late_pct = 100 * deaths_2021_2024 / n_late,
+         diff_pp = share_late_pct - share_early_pct,
+         test = map2(deaths_2021_2024, deaths_1999_2020, \(a, b) suppressWarnings(prop.test(c(a, b), c(n_late, n_early)))),
+         diff_lo_pp = 100 * map_dbl(test, \(t) t$conf.int[1]), diff_hi_pp = 100 * map_dbl(test, \(t) t$conf.int[2]),
+         p_value = map_dbl(test, "p.value"), p_holm = p.adjust(p_value, "holm")) |>
+  select(place_of_death, deaths_1999_2020, deaths_2021_2024, share_early_pct, share_late_pct, diff_pp, diff_lo_pp, diff_hi_pp, p_value, p_holm)
+set.seed(seed)
+pod_chisq <- chisq.test(rbind(early = pod_period$deaths_1999_2020, late = pod_period$deaths_2021_2024),
+                        simulate.p.value = TRUE, B = 10000)
+print(pod_shift, width = Inf); print(pod_chisq)
+message("[POD] categories excluded from the shift test because one period is suppressed: ",
+        paste(setdiff(pod_clean$place_of_death, pod_period$place_of_death), collapse = "; "))
+save_tbl(pod_shift, "pod_shift")
+```
+
+## 4.8 ANALYZE: projection of the OVERALL age-adjusted rate to 2040 (illustrative)
+
+```{r}
+#| label: s4-8
+proj_end   <- 2040L
+last_obs   <- max(overall_clean$year)
+new_years  <- (last_obs + 1L):proj_end
+h_proj     <- length(new_years)                       # = 16; forecast(h = 6) would stop at 2030, so h is derived from proj_end
+last_jp_year <- jp_points |> filter(file == "OVERALL") |> pull(joinpoint_year) |> max()
+if (!is.finite(last_jp_year)) last_jp_year <- round(bp_est)
+
+# (a) naive linear extrapolation with prediction intervals: full period, and the post-Joinpoint segment
+lm_full <- lm(rate ~ year, data = overall_clean)
+lm_seg  <- lm(rate ~ year, data = filter(overall_clean, year >= last_jp_year))
+pred_lin <- \(fit, label) {
+  p <- predict(fit, newdata = tibble(year = new_years), interval = "prediction", level = 0.95)
+  tibble(year = new_years, method = label, estimate = p[, "fit"], lower = p[, "lwr"], upper = p[, "upr"])
+}
+proj_linear <- bind_rows(pred_lin(lm_full, paste0("Linear trend, ", min(overall_clean$year), "-", last_obs)),
+                         pred_lin(lm_seg,  paste0("Linear trend, post-Joinpoint ", last_jp_year, "-", last_obs)))
+
+# (b) time-series forecasts: auto.arima and ets on the annual series
+ov_ts       <- ts(ov$rate, start = min(ov$year), frequency = 1)
+fit_arima   <- forecast::auto.arima(ov_ts, ic = "aicc", stepwise = FALSE, approximation = FALSE)
+fit_ets     <- forecast::ets(ov_ts)
+forecast_arima <- forecast::forecast(fit_arima, h = h_proj, level = c(80, 95))
+forecast_ets   <- forecast::forecast(fit_ets,   h = h_proj, level = c(80, 95))
+arima_label <- tryCatch(as.character(fit_arima), error = \(e) "ARIMA")
+print(fit_arima); print(fit_ets)
+
+# residual diagnostics (also written to PNG at 300 dpi, 8 x 6 in)
+png(file.path(fig_dir, "diagnostics_arima_residuals.png"), width = 8, height = 6, units = "in", res = 300)
+forecast::checkresiduals(fit_arima); invisible(dev.off())
+png(file.path(fig_dir, "diagnostics_ets_residuals.png"), width = 8, height = 6, units = "in", res = 300)
+forecast::checkresiduals(fit_ets);   invisible(dev.off())
+forecast::checkresiduals(fit_arima)                                     # also show on screen (prints Ljung-Box test)
+ljung <- \(fit, k) tryCatch(Box.test(residuals(fit), lag = 5, type = "Ljung-Box", fitdf = k)$p.value, error = \(e) NA_real_)
+ljung_box_p <- c(arima = ljung(fit_arima, length(fit_arima$coef)), ets = ljung(fit_ets, 0))
+
+# accuracy: in-sample + rolling-origin one-step cross-validation (16 origins), against a random-walk-with-drift benchmark
+f_arima <- \(x, h) forecast::forecast(forecast::auto.arima(x), h = h)
+f_ets   <- \(x, h) forecast::forecast(forecast::ets(x), h = h)
+f_drift <- \(x, h) forecast::rwf(x, h = h, drift = TRUE)
+rmse <- \(e) sqrt(mean(e^2, na.rm = TRUE)); mae <- \(e) mean(abs(e), na.rm = TRUE)
+cv_err <- list(arima = forecast::tsCV(ov_ts, f_arima, h = 1, initial = 10),
+               ets   = forecast::tsCV(ov_ts, f_ets,   h = 1, initial = 10),
+               drift = forecast::tsCV(ov_ts, f_drift, h = 1, initial = 10))
+forecast_accuracy <- bind_rows(
+  as_tibble(forecast::accuracy(fit_arima)) |> mutate(model = arima_label, .before = 1),
+  as_tibble(forecast::accuracy(fit_ets))   |> mutate(model = fit_ets$method, .before = 1)) |>
+  mutate(cv_rmse_1step = c(rmse(cv_err$arima), rmse(cv_err$ets)), cv_mae_1step = c(mae(cv_err$arima), mae(cv_err$ets)),
+         cv_rmse_drift_benchmark = rmse(cv_err$drift), ljung_box_p = unname(ljung_box_p))
+print(forecast_accuracy, width = Inf)
+
+fc_tbl <- \(fc, label) tibble(year = new_years, method = label, estimate = as.numeric(fc$mean),
+                              lower = as.numeric(fc$lower[, "95%"]), upper = as.numeric(fc$upper[, "95%"]))
+# (c) combined projection tibble (feeds Figure 7)
+projection_tbl <- bind_rows(proj_linear, fc_tbl(forecast_arima, arima_label), fc_tbl(forecast_ets, paste0("ETS: ", fit_ets$method))) |>
+  mutate(lower = pmax(lower, 0))
+projection_summary <- projection_tbl |> filter(year %in% c(2030L, proj_end)) |> arrange(method, year)
+print(projection_summary, width = Inf)
+projection_caveat <- paste("Projections extrapolate the 1999-2024 pattern and assume no major change in screening, HPV vaccination uptake, clinical practice",
+                           "or coding. With ~26 annual points the intervals are wide and the linear and time-series methods diverge.",
+                           "Illustrative only; not a prediction of individual risk.")
+save_tbl(projection_tbl, "projection_2025_2040"); save_tbl(forecast_accuracy, "forecast_accuracy"); save_tbl(projection_summary, "projection_summary")
+```
+
+# Phase 5 - SHARE
+
+## 5.0 SHARE: shared figure settings (colour-blind-safe viridis, captions built from objects created earlier)
+
+```{r}
+#| label: s5-0
+# Every figure below reads only objects created in Phases 3-4; nothing is typed in by hand.
+viridis_d <- \(n, ...) viridisLite::viridis(n, end = 0.9, ...)      # viridisLite ships with ggplot2 (dependency), so no extra install
+stopifnot("viridisLite is needed (installed with ggplot2)" = requireNamespace("viridisLite", quietly = TRUE))
+race_note <- race_footnotes |>
+  str_replace_all("beacuse", "because") |>                          # source file contains the typo 'beacuse'; corrected for display only
+  str_wrap(width = 150) |> paste(collapse = "\n")
+urban_last <- scope_checks$urban_year_range[2]                       # detected automatically in Phase 3
+x_breaks   <- seq(2000, 2024, by = 4)
+```
+
+## 5.1 Figure 1: overall age-adjusted mortality rate with 95% CI ribbon (7.0 x 4.5 in, 300 dpi)
+
+```{r}
+#| label: s5-1
+fig1 <- ggplot(overall_clean, aes(year, rate)) +
+  geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper, fill = "95% confidence interval"), alpha = 0.25) +
+  geom_line(aes(colour = "Age-adjusted rate"), linewidth = 0.9) +
+  geom_point(aes(colour = "Age-adjusted rate"), size = 1.8) +
+  geom_vline(xintercept = bp_est, linetype = "dotted", colour = "grey35") +          # segmented-regression breakpoint (Phase 4.4)
+  annotate("text", x = bp_est, y = Inf, label = sprintf("Segmented breakpoint: %.1f", bp_est),
+           hjust = 1.05, vjust = 1.6, size = 3, colour = "grey30") +
+  scale_colour_manual(values = c("Age-adjusted rate" = viridis_d(3)[1]), name = NULL) +
+  scale_fill_manual(values = c("95% confidence interval" = viridis_d(3)[2]), name = NULL) +
+  scale_x_continuous(breaks = x_breaks) +
+  scale_y_continuous(limits = c(0, NA), expand = expansion(mult = c(0, 0.08))) +
+  labs(title = "Vulvar cancer age-adjusted mortality rate, United States, 1999-2024",
+       subtitle = "Annual rate per 100,000 women with 95% confidence interval",
+       x = "Year of death", y = "Age-adjusted mortality rate per 100,000", caption = cap_std)
+save_fig(fig1, "fig1_overall_trend", 7, 4.5)
+```
+
+## 5.2 Figure 2: race/ethnicity trends, faceted (9.0 x 6.0 in, 300 dpi)
+
+```{r}
+#| label: s5-2
+# Reliable rates (>=20 deaths) are drawn as lines + ribbons; unreliable/short series appear as hollow points only, never as a trend line.
+race_plot <- race_clean |> filter(!is.na(rate)) |>
+  mutate(reliability = if_else(rate_unreliable, "Unreliable (<20 deaths)", "Reliable"))
+fig2 <- ggplot(race_plot, aes(year, rate, colour = group, fill = group)) +
+  geom_ribbon(data = filter(race_plot, !rate_unreliable), aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.2, colour = NA) +
+  geom_line(data = filter(race_plot, !rate_unreliable), linewidth = 0.8) +
+  geom_point(aes(shape = reliability), size = 1.8, stroke = 0.8, fill = "white") +
+  scale_shape_manual(values = c("Reliable" = 16, "Unreliable (<20 deaths)" = 1), name = NULL) +
+  scale_colour_viridis_d(end = 0.9, guide = "none") + scale_fill_viridis_d(end = 0.9, guide = "none") +
+  facet_wrap(vars(group), scales = "free_y", ncol = 2) +
+  scale_x_continuous(breaks = x_breaks) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(title = "Age-adjusted vulvar cancer mortality by race and ethnicity, 1999-2024",
+       subtitle = "Free y-axes: compare within-group trends here; between-group ratios are in the rate-ratio table",
+       x = "Year of death", y = "Age-adjusted mortality rate per 100,000",
+       caption = paste0(cap_std, "\nRace and Hispanic-ethnicity groups overlap. ", race_note))
+save_fig(fig2, "fig2_race_trends", 9, 6)
+```
+
+## 5.3 Figure 3: deaths by place of death, sorted descending with forcats::fct_reorder (7.5 x 4.5 in, 300 dpi)
+
+```{r}
+#| label: s5-3
+pod_plot <- pod_clean |>
+  mutate(place_label = str_wrap(place_of_death, 32),
+         bound = if_else(total_is_lower_bound, "Total is a lower bound (one period suppressed)", "Complete count")) |>
+  mutate(place_label = fct_reorder(place_label, total_deaths_calc))       # ascending levels -> largest bar at the top after horizontal layout
+fig3 <- ggplot(pod_plot, aes(total_deaths_calc, place_label, fill = bound)) +
+  geom_col(width = 0.75) +
+  geom_text(aes(label = comma(total_deaths_calc)), hjust = -0.1, size = 3) +
+  scale_fill_manual(values = c("Complete count" = viridis_d(3)[1], "Total is a lower bound (one period suppressed)" = viridis_d(3)[3]), name = NULL) +
+  scale_x_continuous(labels = comma, expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Vulvar cancer deaths by place of death, 1999-2024",
+       subtitle = "Cumulative deaths; categories sorted by total",
+       x = "Deaths (1999-2024)", y = NULL,
+       caption = paste0("Source: CDC WONDER, NVSS Underlying Cause of Death, ICD-10 C51. Counts <10 are suppressed by CDC; a suppressed period is left as missing (not zero),\n",
+                        "so that category's total is a lower bound. True zeros (e.g., unknown place in 2021-2024) are shown as reported."))
+save_fig(fig3, "fig3_place_of_death", 7.5, 4.5)
+```
+
+## 5.4 Figure 4: usmap choropleth of cumulative state deaths, suppressed states in a distinct fill (9.0 x 5.5 in, 300 dpi)
+
+```{r}
+#| label: s5-4
+# Joined on 2-digit FIPS (zero-padded text) - robust to the 'New york' capitalisation problem fixed in Phase 3.
+# Counts, not rates: large states dominate. States with a suppressed period are NOT given a misleading partial total; they get a grey class.
+state_map <- states_clean |>
+  mutate(deaths_for_map = if_else(total_is_lower_bound, NA_real_, total_deaths))
+cls_breaks <- unique(c(min(state_map$deaths_for_map, na.rm = TRUE),
+                       round(quantile(state_map$deaths_for_map, c(.2, .4, .6, .8), na.rm = TRUE), -1),
+                       max(state_map$deaths_for_map, na.rm = TRUE)))
+cls_labels <- sprintf("%s-%s", comma(head(cls_breaks, -1)), comma(tail(cls_breaks, -1)))
+suppr_label <- "Suppressed period (count <10) - total not shown"
+state_map <- state_map |>
+  mutate(deaths_class = cut(deaths_for_map, breaks = cls_breaks, labels = cls_labels, include.lowest = TRUE) |>
+           as.character() |> coalesce(suppr_label) |> factor(levels = c(cls_labels, suppr_label))) |>
+  select(fips, deaths_class)
+stopifnot("Every state/DC must be mapped" = nrow(state_map) == 51, "usmap join keys must be unique" = !anyDuplicated(state_map$fips))
+suppressed_states <- states_clean |> filter(total_is_lower_bound) |> pull(state)
+map_cols <- c(setNames(viridis_d(length(cls_labels)), cls_labels), setNames("grey80", suppr_label))
+fig4 <- usmap::plot_usmap(data = state_map, values = "deaths_class", regions = "states", color = "white") +
+  scale_fill_manual(values = map_cols, name = "Cumulative deaths\n1999-2024", drop = FALSE) +
+  guides(fill = guide_legend(nrow = 2, byrow = TRUE)) +
+  labs(title = "Cumulative vulvar cancer deaths by state, 1999-2024",
+       subtitle = "Counts (not rates); classes are quintile-based",
+       caption = paste0("Source: CDC WONDER, ICD-10 C51. Counts <10 are suppressed. Grey = a period was suppressed (",
+                        paste(suppressed_states, collapse = ", "), "); the partial total is withheld rather than shown as if complete.\n",
+                        "Counts reflect population size; use rates for between-state comparison.")) +
+  theme(legend.position = "bottom", legend.text = element_text(size = 7))
+save_fig(fig4, "fig4_state_map", 9, 5.5)
+```
+
+## 5.5 Figure 5: trends by age group (7.0 x 4.5 in, 300 dpi)
+
+```{r}
+#| label: s5-5
+fig5 <- ggplot(filter(age_clean, !is.na(rate)), aes(year, rate, colour = group, fill = group)) +
+  geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.15, colour = NA) +
+  geom_line(linewidth = 0.9) + geom_point(size = 1.5) +
+  scale_colour_viridis_d(end = 0.85, name = "Age group") + scale_fill_viridis_d(end = 0.85, name = "Age group") +
+  scale_x_continuous(breaks = x_breaks) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(title = "Vulvar cancer age-adjusted mortality rate by age group, 1999-2024",
+       subtitle = "Shaded bands: 95% confidence intervals",
+       x = "Year of death", y = "Age-specific rate per 100,000",
+       caption = paste0(cap_std, "\nOnly ", length(scope_checks$age_groups), " bands are available (",
+                        paste(scope_checks$age_groups, collapse = ", "), "); there is no under-35 group in the extract."))
+save_fig(fig5, "fig5_age_trends", 7, 4.5)
+```
+
+## 5.6 Figure 6: Metro vs Non-metro, with the data cutoff shown on the plot and in the caption (7.0 x 4.5 in, 300 dpi)
+
+```{r}
+#| label: s5-6
+fig6 <- ggplot(urban_clean, aes(year, rate, colour = group, fill = group)) +
+  annotate("rect", xmin = urban_last + 0.5, xmax = max(study_years) + 0.5, ymin = -Inf, ymax = Inf, fill = "grey90", alpha = 0.6) +
+  annotate("text", x = mean(c(urban_last + 0.5, max(study_years) + 0.5)), y = Inf, label = "No urbanization\ndata", vjust = 1.4, size = 3, colour = "grey35") +
+  geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper), alpha = 0.2, colour = NA) +
+  geom_line(linewidth = 0.9) + geom_point(size = 1.5) +
+  scale_colour_viridis_d(end = 0.75, name = NULL) + scale_fill_viridis_d(end = 0.75, name = NULL) +
+  scale_x_continuous(breaks = x_breaks, limits = c(min(study_years) - 0.5, max(study_years) + 0.5)) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(title = "Metro vs non-metro vulvar cancer mortality, 1999-2020",
+       subtitle = "Age-adjusted rate per 100,000 with 95% confidence intervals",
+       x = "Year of death", y = "Age-adjusted mortality rate per 100,000",
+       caption = paste0(cap_std, "\nUrbanization data cover ", scope_checks$urban_year_range[1], "-", urban_last,
+                        " only; no ", min(scope_checks$urban_missing_years), "-", max(scope_checks$urban_missing_years),
+                        " data in the extract (possible NCHS urban-rural scheme revision)."))
+save_fig(fig6, "fig6_metro_nonmetro", 7, 4.5)
+```
+
+## 5.7 Figure 7: observed rate plus projection to 2040; observed = solid, projected = dashed with shaded 95% intervals (8.0 x 5.0 in, 300 dpi)
+
+```{r}
+#| label: s5-7
+proj_cols <- setNames(viridis_d(n_distinct(projection_tbl$method), option = "C"), unique(projection_tbl$method))
+fig7 <- ggplot() +
+  annotate("rect", xmin = last_obs + 0.5, xmax = proj_end + 0.5, ymin = -Inf, ymax = Inf, fill = "grey93") +
+  annotate("text", x = (last_obs + proj_end) / 2 + 0.5, y = Inf, label = "PROJECTED (illustrative)", vjust = 1.5, size = 3, fontface = "bold", colour = "grey35") +
+  geom_ribbon(data = projection_tbl, aes(year, ymin = lower, ymax = upper, fill = method), alpha = 0.15) +
+  geom_line(data = projection_tbl, aes(year, estimate, colour = method), linetype = "dashed", linewidth = 0.9) +
+  geom_ribbon(data = overall_clean, aes(year, ymin = ci_lower, ymax = ci_upper), fill = "black", alpha = 0.15) +
+  geom_line(data = overall_clean, aes(year, rate), colour = "black", linewidth = 1) +
+  geom_point(data = overall_clean, aes(year, rate), colour = "black", size = 1.6) +
+  scale_colour_manual(values = proj_cols, name = "Projection method (dashed)") +
+  scale_fill_manual(values = proj_cols, name = "Projection method (dashed)") +
+  scale_x_continuous(breaks = seq(2000, 2040, by = 5)) +
+  coord_cartesian(ylim = c(0, NA)) +
+  guides(colour = guide_legend(nrow = 2, byrow = TRUE), fill = guide_legend(nrow = 2, byrow = TRUE)) +
+  labs(title = "Observed (1999-2024) and projected (2025-2040) vulvar cancer mortality",
+       subtitle = "Solid black = observed with 95% CI; dashed = projections with 95% prediction/forecast intervals",
+       x = "Year", y = "Age-adjusted mortality rate per 100,000",
+       caption = paste0(cap_std, "\n", str_wrap(projection_caveat, 150)))
+save_fig(fig7, "fig7_projection", 8, 5)
+```
+
+## 5.8 Multi-panel figures for journal submission (patchwork; panel tags A-D; one shared caption per composite)
+
+```{r}
+#| label: s5-8
+strip_cap <- \(p) p + labs(caption = NULL)
+composite_trends <- (strip_cap(fig1) + strip_cap(fig7)) / (strip_cap(fig5) + strip_cap(fig6)) +
+  plot_annotation(tag_levels = "A", title = "Figure A. Overall, projected, age-specific and urban-rural mortality",
+                  caption = paste0(cap_std, "\nPanel D covers 1999-2020 only. Panel B projections are illustrative.")) &
+  theme(plot.tag = element_text(face = "bold"))
+save_fig(composite_trends, "fig_composite_trends", 14, 9.5)
+
+composite_disparity <- strip_cap(fig2) / (strip_cap(fig4) + strip_cap(fig3)) +
+  plot_layout(heights = c(1.3, 1)) +
+  plot_annotation(tag_levels = "A", title = "Figure B. Disparities by race and ethnicity, geography and place of death",
+                  caption = paste0(cap_std, "\n", race_note, "\nPanel B counts (not rates); grey = suppressed period.")) &
+  theme(plot.tag = element_text(face = "bold"))
+save_fig(composite_disparity, "fig_composite_disparity", 14, 12)
+
+figure_manifest <- tibble(file = list.files(fig_dir, pattern = "\\.png$")) |>
+  mutate(bytes = file.size(file.path(fig_dir, file)))
+stopifnot("Expected 7 single figures + 2 composites" = sum(str_detect(figure_manifest$file, "^fig")) >= 9)
+print(figure_manifest); save_tbl(figure_manifest, "figure_manifest")
+```
+
+# Phase 6 - ACT
+
+## 6.1 ACT: helpers that pull evidence text out of the objects created in Phases 3-4 (nothing typed by hand)
+
+```{r}
+#| label: s6-1
+# safe_txt() evaluates an expression lazily; if the object is missing/empty it returns a visible placeholder instead of failing.
+safe_txt <- function(expr) {
+  out <- tryCatch(expr, error = \(e) NA_character_)
+  if (length(out) == 0 || all(is.na(out))) "[not available - inspect the linked object]" else paste(out, collapse = "; ")
+}
+fmt3 <- \(est, lo, hi, d = 2) sprintf(paste0("%.", d, "f (%.", d, "f to %.", d, "f)"), est, lo, hi)
+```
+
+## 6.2 ACT: Discussion outline (structure of the manuscript Discussion; each block names the objects to read)
+
+```{r}
+#| label: s6-2
+discussion_outline <- tribble(
+  ~order, ~section, ~what_to_write, ~read_from_objects,
+  1, "Principal findings", "One paragraph: overall level and direction of AAMR, breakpoint (if supported by Davies test / AIC), largest disparities, place-of-death shift, projection range.",
+     "jp_overall_aapc; segmented_summary; model_compare; rr_all; pod_shift; projection_summary",
+  2, "Comparison with prior literature", "Compare with SEER/NCI incidence and survival trends and with other CDC WONDER cancer-mortality analyses; discuss HPV-associated (younger) vs HPV-independent (older, lichen sclerosus/differentiated VIN) pathways.",
+     "aapc_compare_primary; age_clean; descr_by_stratum",
+  3, "Temporal trend and inflection", "Report CDC Joinpoint AAPC beside own log-linear APC; state whether they agree; interpret breakpoint with its CI; note autocorrelation caveat.",
+     "aapc_compare_primary; segmented_summary; hinge_sensitivity; ols (dw_p column)",
+  4, "COVID-era effect", "Report ITS level shift/slope change (Newey-West CI) and counterfactual; explain that the naive pre/post t-test is confounded by the pre-existing trend; discuss diagnosis delays and death-certificate coding.",
+     "its_table; covid_counterfactual; covid_tests",
+  5, "Demographic disparities", "Rate ratios by race (White reference) and age pattern; state that Hispanic ethnicity overlaps race categories; AI/AN and Asian/PI limited by suppression/unreliable rates.",
+     "rr_race_table; race_footnotes; scope_checks$race_coverage; age_clean",
+  6, "Geographic variation", "Region and metro/non-metro rate ratios; state counts are population-driven (map shows counts); urbanization ends 2020.",
+     "rr_region_table; rr_urban_table; states_clean; scope_checks$urban_year_range",
+  7, "Place of death", "Shift in shares between 1999-2020 and 2021-2024 (Holm-adjusted); implications for palliative and hospice capacity.",
+     "pod_shift; pod_chisq",
+  8, "Projection", "Present as an illustrative scenario with intervals; explain method divergence; cross-validated accuracy.",
+     "projection_tbl; forecast_accuracy; projection_caveat",
+  9, "Limitations", "Use the auto-populated table below (small-number suppression, ecological design, urbanization gap, COVID-era effects, race exclusions, SE anomaly, reconciliation, projection).",
+     "limitations_table",
+  10, "Conclusions and recommendations", "Three actionable recommendations tied to results (see findings_to_recs).",
+      "findings_to_recs"
+)
+```
+
+## 6.3 ACT: auto-populated Limitations table (details are generated from objects, so they update if the data change)
+
+```{r}
+#| label: s6-3
+recon_gaps <- recon |> filter(diff != 0) |>
+  transmute(txt = sprintf("%s [%s] %+d vs %s (%s)", source, scope, as.integer(diff), reference, status))
+race_cov <- scope_checks$race_coverage
+n_dw_sig <- sum(ols$dw_p < 0.05, na.rm = TRUE)
+
+limitations_table <- tribble(
+  ~limitation, ~auto_populated_detail, ~source_objects, ~likely_direction_of_bias,
+  "Small-number suppression across strata",
+  safe_txt(sprintf("CDC suppressed %d STATES cell(s) and %d POD cell(s) (counts <10). %d of %d stratum-years in the long table have <20 deaths or a text flag and are marked rate_unreliable (excluded from trend and rate-ratio estimates).",
+                   states_out$n_suppressed, pod_out$n_suppressed, sum(wonder_long$rate_unreliable), nrow(wonder_long))),
+  "states_out; pod_out; wonder_long$rate_unreliable", "Underestimates totals for suppressed cells; reduces power in small groups",
+  "Cross-file totals do not reconcile (logged, not forced)",
+  safe_txt(recon_gaps$txt),
+  "recon; overall_total_row", "Finer strata lose suppressed cells (shortfall); RACE exceeds OVERALL because Hispanic ethnicity overlaps race",
+  "Ecological (aggregate) mortality data",
+  "Death-certificate counts and population denominators only; no individual HPV status, smoking, immunosuppression, screening or treatment history, so no individual-level causal inference (ecological fallacy).",
+  "wonder_long", "Unmeasured confounding; associations describe populations, not individuals",
+  "Urbanization has no 2021-2024 data",
+  safe_txt(sprintf("Urbanization covers %d-%d; missing years detected: %s. Metro/non-metro conclusions cannot speak to the COVID era or later.",
+                   scope_checks$urban_year_range[1], scope_checks$urban_year_range[2], paste(scope_checks$urban_missing_years, collapse = ", "))),
+  "scope_checks$urban_year_range; scope_checks$urban_missing_years", "Temporal scope differs from the other variables",
+  "Possible COVID-era diagnosis, registration and coding effects",
+  safe_txt(sprintf("ITS level shift in 2020: %s %% (Newey-West CI); observed rate exceeded the counterfactual prediction interval in %d of %d post-2019 years. Delayed diagnosis, altered certification and pandemic-period competing mortality cannot be separated.",
+                   fmt3(its_table$pct_effect[its_table$term == "post"], its_table$pct_lo[its_table$term == "post"], its_table$pct_hi[its_table$term == "post"]),
+                   sum(covid_counterfactual$above_prediction_interval), nrow(covid_counterfactual))),
+  "its_table; covid_counterfactual; covid_tests", "Either direction; only 5 post-2019 points",
+  "AI/AN and Asian/Pacific Islander excluded from parts of the race analysis",
+  safe_txt(c(str_replace_all(race_footnotes, "beacuse", "because"),
+             sprintf("Reliable years in the file: %s", paste0(race_cov$group, " = ", race_cov$n_years - race_cov$n_unreliable, collapse = "; ")))),
+  "race_footnotes; scope_checks$race_coverage", "Disparities for smallest groups are not estimable; possible hidden excess burden",
+  "Reported standard errors in CENSUS_REGION are internally inconsistent",
+  safe_txt(sprintf("%d stratum-year(s) have a reported SE that disagrees (>3x or <1/3) with the SE implied by the 95%% CI: %s. CI-implied SEs were used for all rate ratios and weights.",
+                   nrow(se_flagged), paste0(se_flag_summary$group, " (", se_flag_summary$years, ")", collapse = "; "))),
+  "se_flagged; se_flag_summary", "Would inflate uncertainty if reported SE were used; avoided",
+  "Age bands are limited",
+  safe_txt(sprintf("AGE file contains only: %s (no under-35 band). Age-specific rates cannot describe younger, HPV-associated cases.", paste(scope_checks$age_groups, collapse = ", "))),
+  "scope_checks$age_groups", "HPV-related trend in young women not assessable",
+  "Short series and autocorrelation",
+  safe_txt(sprintf("%d annual points per series; Durbin-Watson p<0.05 in %d of %d log-linear fits, so OLS CIs may be too narrow.", nrow(overall_clean), n_dw_sig, nrow(ols))),
+  "ols; loglinear_trends", "Overconfident trend inference",
+  "Projection is illustrative, not predictive",
+  projection_caveat,
+  "projection_tbl; forecast_accuracy; projection_caveat", "Wide, method-dependent intervals; structural change would invalidate them"
+)
+print(limitations_table, width = Inf)
+```
+
+## 6.4 ACT: findings-to-recommendations tibble (each recommendation is tied to the objects that support it)
+
+```{r}
+#| label: s6-4
+age_means <- descr_by_stratum |> filter(file == "AGE")
+top_rr <- rr_all |> filter(window == "all_years", rr_lo > 1) |> arrange(desc(rr)) |> slice_head(n = 3)
+big_shift <- pod_shift |> slice_max(abs(diff_pp), n = 1, with_ties = FALSE)
+proj_end_rows <- projection_tbl |> filter(year == proj_end)
+
+findings_to_recs <- tribble(
+  ~rec_id, ~recommendation, ~priority_stakeholders, ~supporting_r_objects, ~supporting_evidence, ~caveat,
+  "R1", "Strengthen prevention and early detection: sustain HPV vaccination uptake, and promote vulvar examination with biopsy of persistent lesions in primary care and gynecology, prioritising women in the highest-rate age band.",
+        "ACOG / gynecologic oncology societies; HPV advocacy groups; NCI/SEER",
+        "jp_overall_aapc; segmented_summary; age_means; loglinear_trends",
+        safe_txt(c(sprintf("CDC AAPC %s %%/yr", fmt3(jp_overall_aapc$aapc[1], jp_overall_aapc$ci_lower[1], jp_overall_aapc$ci_upper[1])),
+                   sprintf("segmented APC after breakpoint (%.1f): %s %%/yr", segmented_summary$breakpoint[1], fmt3(segmented_summary$apc[2], segmented_summary$apc_lo[2], segmented_summary$apc_hi[2])),
+                   paste0("mean AAMR ", age_means$group, " = ", sprintf("%.2f", age_means$mean_rate)))),
+        "Vaccination effects on mortality are decades away; the AGE file has no under-35 band, so vaccine impact cannot be assessed here.",
+  "R2", "Direct disparity-targeted funding, navigation and access programmes to the groups and regions with the highest mortality rate ratios; improve reporting for AI/AN and Asian/PI groups.",
+        "State health departments; policymakers; NCI/SEER",
+        "rr_race_table; rr_region_table; rr_urban_table; rr_all",
+        safe_txt(sprintf("%s vs %s: RR %s (all years)", top_rr$comparator, top_rr$reference, fmt3(top_rr$rr, top_rr$rr_lo, top_rr$rr_hi))),
+        "Rate ratios are ecological; Hispanic overlaps race; region SEs came from CIs; urbanization ends 2020.",
+  "R3", "Plan supportive-care and end-of-life capacity (home, hospice, nursing facility) and maintain surveillance so that projections and place-of-death shifts are re-estimated as new WONDER years release.",
+        "Policymakers; state health departments; palliative-care networks",
+        "pod_shift; pod_chisq; projection_tbl; forecast_accuracy; its_table",
+        safe_txt(c(sprintf("largest place-of-death share change: %s, %+.1f pp (Holm p = %.3g)", big_shift$place_of_death, big_shift$diff_pp, big_shift$p_holm),
+                   paste0("projected AAMR in ", proj_end, ", ", proj_end_rows$method, ": ", sprintf("%.2f (%.2f-%.2f)", proj_end_rows$estimate, proj_end_rows$lower, proj_end_rows$upper)))),
+        "Projections assume no change in screening, vaccination or practice; intervals are wide; use as planning scenarios only."
+)
+print(findings_to_recs, width = Inf)
+```
+
+## 6.5 ACT: export (CSV + formatted gt tables + markdown for the manuscript)
+
+```{r}
+#| label: s6-5
+save_tbl(discussion_outline, "discussion_outline")
+save_tbl(limitations_table,  "limitations_table")
+save_tbl(findings_to_recs,   "findings_to_recommendations")
+save_md(limitations_table,  "limitations_table",  "Table 4. Limitations (auto-populated)")
+save_md(findings_to_recs,   "findings_to_recommendations", "Table 5. Findings-to-recommendations")
+
+gt_limits <- limitations_table |> gt() |>
+  tab_header(title = "Table 4. Study limitations", subtitle = "Details generated from the analysis objects") |>
+  cols_label(limitation = "Limitation", auto_populated_detail = "Detail (from data)", source_objects = "R objects", likely_direction_of_bias = "Likely bias") |>
+  cols_width(limitation ~ px(180), auto_populated_detail ~ px(420), source_objects ~ px(200), likely_direction_of_bias ~ px(200))
+gt_recs <- findings_to_recs |> gt() |>
+  tab_header(title = "Table 5. Findings-to-recommendations") |>
+  cols_label(rec_id = "ID", recommendation = "Recommendation", priority_stakeholders = "Priority stakeholders",
+             supporting_r_objects = "Supporting R objects", supporting_evidence = "Evidence (from data)", caveat = "Caveat")
+gtsave(gt_limits, file.path(tab_dir, "limitations_table.html"))
+gtsave(gt_recs,   file.path(tab_dir, "findings_to_recommendations.html"))
+print(gt_limits); print(gt_recs)
+
+stopifnot("Every recommendation needs linked objects" = all(nzchar(findings_to_recs$supporting_r_objects)),
+          "Limitations table must have >= 9 rows" = nrow(limitations_table) >= 9)
+message("All six phases complete. Outputs in: ", normalizePath(out_dir))
+```
+
+# Reproducibility
+
+## 7.0 Reproducibility: session information (saved next to the outputs)
+
+```{r}
+#| label: s7-0
+print(sessionInfo())
+writeLines(capture.output(sessionInfo()), file.path(out_dir, "sessionInfo.txt"))
+message("Random seed used: ", seed)
+```
+

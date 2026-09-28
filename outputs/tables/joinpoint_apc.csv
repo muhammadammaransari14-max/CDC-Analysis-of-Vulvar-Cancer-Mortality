@@ -1,0 +1,26 @@
+cohort,segment,start_year,end_year,apc,ci_lower,ci_upper,p_value,t_stat,significant,p_less_than_flag,file,group,n_joinpoints
+All - 1 Joinpoint,1.0,1999,2014,0.627,0.1438,1.1126,0.0134,2.7003,TRUE,FALSE,OVERALL,Overall,1
+All - 1 Joinpoint,2.0,2014,2024,2.5991,1.9417,3.2607,1e-6,8.3014,TRUE,TRUE,OVERALL,Overall,1
+White - 2 Joinpoints,1.0,1999,2015,0.8475,0.4521,1.2446,2.69e-4,4.5126,TRUE,FALSE,RACE,White,2
+White - 2 Joinpoints,2.0,2015,2021,4.3172,2.4039,6.2663,1.44e-4,4.7969,TRUE,FALSE,RACE,White,2
+White - 2 Joinpoints,3.0,2021,2024,-0.1776,-3.7615,3.5398,0.919784,-0.1021,FALSE,FALSE,RACE,White,2
+Black or African American - 0 Joinpoints,1.0,1999,2024,0.6434,-0.2137,1.5079,0.134808,1.5476,FALSE,FALSE,RACE,Black or African American,0
+Hispanic or Latino - 0 Joinpoints,1.0,1999,2024,0.2294,-0.4445,0.9079,0.489978,0.7011,FALSE,FALSE,RACE,Hispanic or Latino,0
+Asian - 0 Joinpoints,1.0,2018,2024,-0.4985,-10.1161,10.1482,0.904366,-0.1264,FALSE,FALSE,RACE,Asian,0
+American Indian or Alaska Native - 0 Joinpoints,1.0,2021,2024,-0.9326,-12.6349,12.337,0.778827,-0.3207,FALSE,FALSE,RACE,American Indian or Alaska Native,0
+35-54 yrs - 0 Joinpoints,1.0,1999,2024,1.4854,0.8224,2.1528,1.03e-4,4.6426,TRUE,FALSE,AGE,35-54 yrs,0
+55-74 yrs - 1 Joinpoint,1.0,1999,2013,1.2341,0.3824,2.093,0.006531,3.0191,TRUE,FALSE,AGE,55-74 yrs,1
+55-74 yrs - 1 Joinpoint,2.0,2013,2024,3.5062,2.5819,4.4388,1e-6,7.9898,TRUE,TRUE,AGE,55-74 yrs,1
+75+ yrs - 3 Joinpoints,1.0,1999,2004,-1.6139,-3.4783,0.2864,0.08992,-1.8128,FALSE,FALSE,AGE,75+ yrs,3
+75+ yrs - 3 Joinpoints,2.0,2004,2015,0.4368,-0.21560000000000001,1.0936,0.174493,1.4255,FALSE,FALSE,AGE,75+ yrs,3
+75+ yrs - 3 Joinpoints,3.0,2015,2021,3.0837,1.3863,4.8096,0.001424,3.8989,TRUE,FALSE,AGE,75+ yrs,3
+75+ yrs - 3 Joinpoints,4.0,2021,2024,-0.0239,-3.3277,3.3927,0.988096,-0.0152,FALSE,FALSE,AGE,75+ yrs,3
+Census Region 1: Northeast - 1 Joinpoint,1.0,1999,2018,0.2997,-0.1495,0.7509,0.180106,1.3866,FALSE,FALSE,CENSUS_REGION,Census Region 1: Northeast,1
+Census Region 1: Northeast - 1 Joinpoint,2.0,2018,2024,11.0858,-2.4193,26.46,0.106462,1.6867,FALSE,FALSE,CENSUS_REGION,Census Region 1: Northeast,1
+Census Region 2: Midwest - 1 Joinpoint,1.0,1999,2006,-1.8453,-4.4534,0.834,0.165104,-1.4382,FALSE,FALSE,CENSUS_REGION,Census Region 2: Midwest,1
+Census Region 2: Midwest - 1 Joinpoint,2.0,2006,2024,2.3519,1.5187,3.192,7e-6,5.9141,TRUE,FALSE,CENSUS_REGION,Census Region 2: Midwest,1
+Census Region 3: South - 0 Joinpoints,1.0,1999,2024,1.7846,1.4481,2.1223,1e-6,11.0228,TRUE,TRUE,CENSUS_REGION,Census Region 3: South,0
+Census Region 4: West - 0 Joinpoints,1.0,1999,2024,1.031,0.3978,1.6681,0.002555,3.3672,TRUE,FALSE,CENSUS_REGION,Census Region 4: West,0
+Metro - 1 Joinpoint,1.0,1999,2015,0.3321,0.0116,0.6536,0.043088,2.1861,TRUE,FALSE,URBANIZATION,Metro,1
+Metro - 1 Joinpoint,2.0,2015,2020,3.5102,1.8228,5.2256,3.68e-4,4.4286,TRUE,FALSE,URBANIZATION,Metro,1
+Non Metro - 0 Joinpoints,1.0,1999,2020,2.251,1.6195,2.8865,1e-6,7.4949,TRUE,TRUE,URBANIZATION,Non Metro,0
